@@ -5,14 +5,15 @@
 extern crate glenda;
 extern crate alloc;
 
+use crate::layout::INIT_SLOT;
 use glenda::cap::{CapType, ENDPOINT_SLOT, Endpoint, MONITOR_CAP};
-use glenda::client::{ProcessClient, ResourceClient};
+use glenda::client::{InitClient, ResourceClient};
 use glenda::interface::ResourceService;
+use glenda::interface::system::SystemService;
 use glenda::ipc::Badge;
 
 mod layout;
 mod server;
-use crate::layout::{DEVICE_CAP, DEVICE_SLOT};
 pub use server::NexusManager;
 
 #[unsafe(no_mangle)]
@@ -20,7 +21,6 @@ fn main() -> usize {
     glenda::console::init_logging("Nexus");
     log!("VFS Service starting...");
 
-    let proc_client = ProcessClient::new(MONITOR_CAP);
     let mut res_client = ResourceClient::new(MONITOR_CAP);
 
     // Register Nexus endpoint
@@ -29,37 +29,39 @@ fn main() -> usize {
         return 1;
     }
 
-    // Allocate device endpoint slot
+    log!("Registering Nexus FS Service...");
+    res_client
+        .register_cap(
+            Badge::null(),
+            glenda::protocol::resource::ResourceType::Endpoint,
+            glenda::protocol::resource::FS_ENDPOINT,
+            ENDPOINT_SLOT,
+        )
+        .ok();
+
     if let Err(e) = res_client.get_cap(
         Badge::null(),
         glenda::protocol::resource::ResourceType::Endpoint,
-        glenda::protocol::resource::DEVICE_ENDPOINT,
-        DEVICE_SLOT,
+        glenda::protocol::resource::INIT_ENDPOINT,
+        INIT_SLOT,
     ) {
-        log!("Failed to get device endpoint: {:?}", e);
+        log!("Failed to get init endpoint: {:?}", e);
         return 1;
     }
 
-    // Attempt to fetch InitrdFS endpoint from Resource Manager
-    // We retry because initrdfs might be spawned lazily by fossil after probing ramdisk
-    // TODO: Fix this
-    log!("Attempting to find InitrdFS root...");
-    let initrd_ep = res_client
-        .get_cap(
-            Badge::null(),
-            glenda::protocol::resource::ResourceType::Endpoint,
-            glenda::protocol::resource::INITRD_ENDPOINT,
-            layout::INIT_SLOT,
-        )
-        .expect("Failed to get InitrdFS endpoint");
+    let mut init_client = InitClient::new(Endpoint::from(INIT_SLOT));
 
-    let mut server = NexusManager::new(proc_client, res_client, DEVICE_CAP);
-
-    server.mount("/", Endpoint::from(initrd_ep));
-    log!("Mounted InitrdFS to /");
+    let mut server = NexusManager::new(&mut res_client, &mut init_client);
 
     if let Err(e) = server.init() {
         log!("Failed to init: {:?}", e);
+        return 1;
+    }
+
+    if let Err(e) =
+        server.listen(glenda::cap::ENDPOINT_CAP, glenda::cap::REPLY_SLOT, glenda::cap::RECV_SLOT)
+    {
+        log!("Failed to listen: {:?}", e);
         return 1;
     }
 
