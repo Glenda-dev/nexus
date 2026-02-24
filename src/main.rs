@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(dead_code)]
 
 #[macro_use]
 extern crate glenda;
@@ -13,6 +14,7 @@ use glenda::interface::system::SystemService;
 use glenda::ipc::Badge;
 
 mod layout;
+mod proxy;
 mod server;
 pub use server::NexusManager;
 
