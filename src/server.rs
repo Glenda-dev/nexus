@@ -34,7 +34,7 @@ impl<'a> NexusManager<'a> {
         Self {
             res_client,
             init_client,
-            cspace: CSpaceManager::new(CSPACE_CAP, 100),
+            cspace: CSpaceManager::new(CSPACE_CAP, 16),
             mounts: BTreeMap::new(),
             endpoint: None,
             reply: glenda::cap::REPLY_SLOT,
