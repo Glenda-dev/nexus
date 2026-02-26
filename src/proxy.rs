@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use glenda::cap::{Endpoint, Frame};
+use glenda::cap::Endpoint;
 use glenda::error::Error;
 use glenda::interface::fs::{FileHandleService, FileSystemService};
 use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
@@ -165,43 +165,6 @@ impl FileHandleService for FileHandleProxy {
         utcb.set_badge(badge);
         set_mrs!(utcb, size as usize);
         utcb.set_msg_tag(MsgTag::new(protocol::FS_PROTO, protocol::fs::TRUNCATE, MsgFlags::NONE));
-        self.0.proxy(utcb)?;
-        Err(Error::Success)
-    }
-
-    fn setup_iouring(
-        &mut self,
-        badge: Badge,
-        server_vaddr: usize,
-        client_vaddr: usize,
-        size: usize,
-        frame: Option<Frame>,
-    ) -> Result<(), Error> {
-        let utcb = unsafe { UTCB::new() };
-        utcb.clear();
-        utcb.set_badge(badge);
-        set_mrs!(utcb, server_vaddr, client_vaddr, size);
-        if let Some(f) = frame {
-            utcb.set_cap_transfer(f.cap());
-        }
-        utcb.set_msg_tag(MsgTag::new(
-            protocol::FS_PROTO,
-            protocol::fs::SETUP_IOURING,
-            MsgFlags::NONE,
-        ));
-        self.0.proxy(utcb)?;
-        Err(Error::Success)
-    }
-
-    fn process_iouring(&mut self, badge: Badge) -> Result<(), Error> {
-        let utcb = unsafe { UTCB::new() };
-        utcb.clear();
-        utcb.set_badge(badge);
-        utcb.set_msg_tag(MsgTag::new(
-            protocol::FS_PROTO,
-            protocol::fs::PROCESS_IOURING,
-            MsgFlags::NONE,
-        ));
         self.0.proxy(utcb)?;
         Err(Error::Success)
     }
