@@ -94,7 +94,7 @@ impl<'a> SystemService for NexusManager<'a> {
             utcb.set_recv_window(self.recv);
 
             if let Err(e) = ep.recv(&mut utcb) {
-                log!("Recv error: {:?}", e);
+                error!("Recv error: {:?}", e);
                 continue;
             }
 
