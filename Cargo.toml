@@ -5,8 +5,3 @@ edition = "2024"
 
 [dependencies]
 libglenda-rs = { path = "../../lib/libglenda-rs", features = ["rt-service"] }
-serde = { version = "1.0", default-features = false, features = [
-    "derive",
-    "alloc",
-] }
-serde_json = { version = "1.0", default-features = false, features = ["alloc"] }

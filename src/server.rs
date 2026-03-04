@@ -4,6 +4,7 @@ use alloc::string::String;
 use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply};
 use glenda::client::{InitClient, ResourceClient};
 use glenda::error::Error;
+use glenda::interface::CSpaceService;
 use glenda::interface::InitService;
 use glenda::interface::fs::{FileSystemService, VirtualFileSystemService};
 use glenda::interface::system::SystemService;
@@ -11,7 +12,7 @@ use glenda::ipc::server::{handle_call, handle_cap_call};
 use glenda::ipc::{Badge, MsgTag, UTCB};
 use glenda::protocol;
 use glenda::protocol::fs::{OpenFlags, Stat};
-use glenda::utils::manager::{CSpaceManager, CSpaceService};
+use glenda::utils::manager::CSpaceManager;
 
 pub struct NexusManager<'a> {
     res_client: &'a mut ResourceClient,
@@ -86,9 +87,6 @@ impl<'a> SystemService for NexusManager<'a> {
         loop {
             let mut utcb = unsafe { UTCB::new() };
             utcb.clear();
-
-            // Clear receive slot to avoid AlreadyExists error
-            let _ = self.cspace.root().delete(self.recv);
 
             utcb.set_reply_window(self.reply);
             utcb.set_recv_window(self.recv);
@@ -207,14 +205,14 @@ impl<'a> VirtualFileSystemService for NexusManager<'a> {
     fn mount(&mut self, _badge: Badge, path: &str, target: Endpoint) -> Result<(), Error> {
         log!("Mounting target FS at: {}", path);
         let slot = self.cspace.alloc(self.res_client)?;
-        self.cspace.root().move_cap(target.cap(), slot)?;
+        CSPACE_CAP.move_cap(target.cap(), slot)?;
         self.mounts.insert(String::from(path), Endpoint::from(slot));
         Ok(())
     }
 
     fn unmount(&mut self, _badge: Badge, path: &str) -> Result<(), Error> {
         if let Some(target) = self.mounts.remove(path) {
-            let _ = self.cspace.root().delete(target.cap());
+            let _ = CSPACE_CAP.delete(target.cap());
         }
         Ok(())
     }
