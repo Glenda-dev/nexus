@@ -105,7 +105,7 @@ impl FileHandleService for FileHandleProxy {
         Err(Error::Success)
     }
 
-    fn read(&mut self, badge: Badge, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+    fn read(&mut self, badge: Badge, offset: usize, buf: &mut [u8]) -> Result<usize, Error> {
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -115,7 +115,7 @@ impl FileHandleService for FileHandleProxy {
         Err(Error::Success)
     }
 
-    fn write(&mut self, badge: Badge, offset: u64, buf: &[u8]) -> Result<usize, Error> {
+    fn write(&mut self, badge: Badge, offset: usize, buf: &[u8]) -> Result<usize, Error> {
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -140,7 +140,7 @@ impl FileHandleService for FileHandleProxy {
         Err(Error::Success)
     }
 
-    fn seek(&mut self, badge: Badge, offset: i64, whence: usize) -> Result<u64, Error> {
+    fn seek(&mut self, badge: Badge, offset: i64, whence: usize) -> Result<usize, Error> {
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -159,7 +159,7 @@ impl FileHandleService for FileHandleProxy {
         Err(Error::Success)
     }
 
-    fn truncate(&mut self, badge: Badge, size: u64) -> Result<(), Error> {
+    fn truncate(&mut self, badge: Badge, size: usize) -> Result<(), Error> {
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
