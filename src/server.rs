@@ -102,6 +102,7 @@ impl<'a> SystemService for NexusManager<'a> {
                 }
                 Err(Error::Success) => {
                     // Proxied, no need to reply
+                    let _ = CSPACE_CAP.delete(self.reply);
                 }
                 Err(e) => {
                     log!("Err handling FS request: {:?}", e);
@@ -205,7 +206,7 @@ impl<'a> VirtualFileSystemService for NexusManager<'a> {
     fn mount(&mut self, _badge: Badge, path: &str, target: Endpoint) -> Result<(), Error> {
         log!("Mounting target FS at: {}", path);
         let slot = self.cspace.alloc(self.res_client)?;
-        CSPACE_CAP.move_cap(target.cap(), slot)?;
+            CSPACE_CAP.transfer_self(target.cap(), slot)?;
         self.mounts.insert(String::from(path), Endpoint::from(slot));
         Ok(())
     }
