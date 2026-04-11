@@ -14,6 +14,12 @@ use glenda::protocol;
 use glenda::protocol::fs::{OpenFlags, Stat};
 use glenda::utils::manager::CSpaceManager;
 
+pub struct NexusIpc {
+    endpoint: Option<Endpoint>,
+    reply: CapPtr,
+    recv: CapPtr,
+}
+
 pub struct NexusManager<'a> {
     res_client: &'a mut ResourceClient,
     init_client: &'a mut InitClient,
@@ -25,9 +31,7 @@ pub struct NexusManager<'a> {
     mounts: BTreeMap<String, Endpoint>,
 
     // Lifecycle
-    endpoint: Option<Endpoint>,
-    reply: CapPtr,
-    recv: CapPtr,
+    ipc: NexusIpc,
 }
 
 impl<'a> NexusManager<'a> {
@@ -37,9 +41,11 @@ impl<'a> NexusManager<'a> {
             init_client,
             cspace: CSpaceManager::new(CSPACE_CAP, 16),
             mounts: BTreeMap::new(),
-            endpoint: None,
-            reply: glenda::cap::REPLY_SLOT,
-            recv: glenda::cap::RECV_SLOT,
+            ipc: NexusIpc {
+                endpoint: None,
+                reply: glenda::cap::REPLY_SLOT,
+                recv: glenda::cap::RECV_SLOT,
+            },
         }
     }
 
@@ -72,9 +78,9 @@ impl<'a> SystemService for NexusManager<'a> {
     }
 
     fn listen(&mut self, ep: Endpoint, reply: CapPtr, recv: CapPtr) -> Result<(), Error> {
-        self.endpoint = Some(ep);
-        self.reply = reply;
-        self.recv = recv;
+        self.ipc.endpoint = Some(ep);
+        self.ipc.reply = reply;
+        self.ipc.recv = recv;
         Ok(())
     }
 
@@ -82,14 +88,14 @@ impl<'a> SystemService for NexusManager<'a> {
         log!("Running server loop...");
         self.init_client.report_service(Badge::null(), protocol::init::ServiceState::Running)?;
 
-        let ep = self.endpoint.ok_or(Error::NotInitialized)?;
+        let ep = self.ipc.endpoint.ok_or(Error::NotInitialized)?;
 
         loop {
             let mut utcb = unsafe { UTCB::new() };
             utcb.clear();
 
-            utcb.set_reply_window(self.reply);
-            utcb.set_recv_window(self.recv);
+            utcb.set_reply_window(self.ipc.reply);
+            utcb.set_recv_window(self.ipc.recv);
 
             if let Err(e) = ep.recv(&mut utcb) {
                 error!("Recv error: {:?}", e);
@@ -102,7 +108,7 @@ impl<'a> SystemService for NexusManager<'a> {
                 }
                 Err(Error::Success) => {
                     // Proxied, no need to reply
-                    let _ = CSPACE_CAP.delete(self.reply);
+                    let _ = CSPACE_CAP.delete(self.ipc.reply);
                 }
                 Err(e) => {
                     log!("Err handling FS request: {:?}", e);
@@ -153,7 +159,7 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::MOUNT) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
-                    let target_ep_cap = s.recv;
+                    let target_ep_cap = s.ipc.recv;
                     s.mount(badge, &path, Endpoint::from(target_ep_cap))?;
                     Ok(())
                 })
@@ -162,7 +168,7 @@ impl<'a> SystemService for NexusManager<'a> {
     }
 
     fn reply(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
-        Reply::from(self.reply).reply(utcb)
+        Reply::from(self.ipc.reply).reply(utcb)
     }
 
     fn stop(&mut self) {
