@@ -8,7 +8,7 @@ use glenda::interface::InitService;
 use glenda::interface::fs::{FileHandleService, FileSystemService, VirtualFileSystemService};
 use glenda::interface::system::SystemService;
 use glenda::ipc::server::handle_call;
-use glenda::ipc::{Badge, MsgTag, UTCB};
+use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
 use glenda::protocol;
 use glenda::protocol::fs::{OpenFlags, Stat};
 use glenda::utils::manager::CSpaceManager;
@@ -199,6 +199,36 @@ impl<'a> SystemService for NexusManager<'a> {
                     let mut client = FsClient::new(target);
                     let written = client.write(Badge::null(), offset as usize, &payload)?;
                     Ok(written)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::SETUP_IOURING) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u_inner| {
+                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let mut fwd = unsafe { UTCB::new() };
+                    fwd.clear();
+
+                    let mut flags = MsgFlags::NONE;
+                    if u_inner.get_msg_tag().flags().contains(MsgFlags::HAS_CAP) {
+                        flags |= MsgFlags::HAS_CAP;
+                        fwd.set_cap_transfer(s.ipc.recv);
+                    }
+
+                    fwd.set_mr(0, u_inner.get_mr(0));
+                    fwd.set_mr(1, u_inner.get_mr(1));
+                    fwd.set_mr(2, u_inner.get_mr(2));
+                    fwd.set_msg_tag(MsgTag::new(protocol::FS_PROTO, protocol::fs::SETUP_IOURING, flags));
+                    target.call(&mut fwd)?;
+                    Ok(0usize)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::PROCESS_IOURING) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |_u_inner| {
+                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let mut fwd = unsafe { UTCB::new() };
+                    fwd.clear();
+                    fwd.set_msg_tag(MsgTag::new(protocol::FS_PROTO, protocol::fs::PROCESS_IOURING, MsgFlags::NONE));
+                    target.call(&mut fwd)?;
+                    Ok(0usize)
                 })
             },
             (protocol::FS_PROTO, protocol::fs::CLOSE) => |s: &mut Self, u: &mut UTCB| {
