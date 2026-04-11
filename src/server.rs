@@ -1,14 +1,13 @@
-use crate::proxy::FileSystemProxy;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply};
-use glenda::client::{InitClient, ResourceClient};
+use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply, Rights};
+use glenda::client::{FsClient, InitClient, ResourceClient};
 use glenda::error::Error;
 use glenda::interface::CSpaceService;
 use glenda::interface::InitService;
-use glenda::interface::fs::{FileSystemService, VirtualFileSystemService};
+use glenda::interface::fs::{FileHandleService, FileSystemService, VirtualFileSystemService};
 use glenda::interface::system::SystemService;
-use glenda::ipc::server::{handle_call, handle_cap_call};
+use glenda::ipc::server::handle_call;
 use glenda::ipc::{Badge, MsgTag, UTCB};
 use glenda::protocol;
 use glenda::protocol::fs::{OpenFlags, Stat};
@@ -29,6 +28,8 @@ pub struct NexusManager<'a> {
 
     // Namespace Management (Path -> Target FS Endpoint)
     mounts: BTreeMap<String, Endpoint>,
+    // File-handle route (caller badge -> target FS endpoint)
+    open_routes: BTreeMap<usize, Endpoint>,
 
     // Lifecycle
     ipc: NexusIpc,
@@ -41,6 +42,7 @@ impl<'a> NexusManager<'a> {
             init_client,
             cspace: CSpaceManager::new(CSPACE_CAP, 16),
             mounts: BTreeMap::new(),
+            open_routes: BTreeMap::new(),
             ipc: NexusIpc {
                 endpoint: None,
                 reply: glenda::cap::REPLY_SLOT,
@@ -66,6 +68,12 @@ impl<'a> NexusManager<'a> {
             }
             (*target, String::from(sub_path))
         })
+    }
+
+    fn mint_badged_endpoint(&mut self, target: Endpoint, badge: Badge) -> Result<Endpoint, Error> {
+        let slot = self.cspace.alloc(self.res_client)?;
+        CSPACE_CAP.mint_self(target.cap(), slot, badge, Rights::ALL)?;
+        Ok(Endpoint::from(slot))
     }
 }
 
@@ -125,12 +133,12 @@ impl<'a> SystemService for NexusManager<'a> {
         ipc_dispatch! {
             self, utcb,
             (protocol::FS_PROTO, protocol::fs::OPEN) => |s: &mut Self, u: &mut UTCB| {
-                handle_cap_call(u, |u| {
+                handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
                     let flags = OpenFlags::from_bits_truncate(u.get_mr(0));
                     let mode = u.get_mr(1) as u32;
-                    let handle_cap = s.open(badge, &path, flags, mode)?;
-                    Ok(CapPtr::from(handle_cap))
+                    let fd = s.open(badge, &path, flags, mode)?;
+                    Ok(fd)
                 })
             },
             (protocol::FS_PROTO, protocol::fs::MKDIR) => |s: &mut Self, u: &mut UTCB| {
@@ -164,6 +172,99 @@ impl<'a> SystemService for NexusManager<'a> {
                     Ok(())
                 })
             },
+            (protocol::FS_PROTO, protocol::fs::UNMOUNT) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u| {
+                    let path = unsafe { u.read_str()? };
+                    s.unmount(badge, &path)?;
+                    Ok(())
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::READ_SYNC) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u_inner| {
+                    let len = u_inner.get_mr(0);
+                    let offset = u_inner.get_mr(1);
+                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let mut client = FsClient::new(target);
+                    let mut buf = alloc::vec![0u8; len];
+                    let read_len = client.read(Badge::null(), offset as usize, &mut buf)?;
+                    u_inner.write(&buf[..read_len]);
+                    Ok(read_len)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::WRITE_SYNC) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u_inner| {
+                    let offset = u_inner.get_mr(0);
+                    let payload = alloc::vec::Vec::from(u_inner.buffer());
+                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let mut client = FsClient::new(target);
+                    let written = client.write(Badge::null(), offset as usize, &payload)?;
+                    Ok(written)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::CLOSE) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |_u_inner| {
+                    let target = s.open_routes.remove(&badge.bits()).ok_or(Error::NotFound)?;
+                    let mut client = FsClient::new(target);
+                    client.close(Badge::null())?;
+                    let _ = CSPACE_CAP.delete(target.cap());
+                    Ok(0usize)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::STAT) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u_inner| {
+                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let client = FsClient::new(target);
+                    let stat = client.stat(Badge::null())?;
+                    unsafe { u_inner.write_obj(&stat)? };
+                    Ok(0usize)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::GETDENTS) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u_inner| {
+                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let count = u_inner.get_mr(0);
+                    let mut client = FsClient::new(target);
+                    let entries = client.getdents(Badge::null(), count)?;
+                    unsafe { u_inner.write_vec(&entries)?; }
+                    Ok(0usize)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::SEEK) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u_inner| {
+                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let offset = u_inner.get_mr(0) as i64;
+                    let whence = u_inner.get_mr(1);
+                    let mut client = FsClient::new(target);
+                    let new_off = client.seek(Badge::null(), offset, whence)?;
+                    Ok(new_off)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::SYNC) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |_u_inner| {
+                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let mut client = FsClient::new(target);
+                    client.sync(Badge::null())?;
+                    Ok(0usize)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::TRUNCATE) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u_inner| {
+                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let size = u_inner.get_mr(0);
+                    let mut client = FsClient::new(target);
+                    client.truncate(Badge::null(), size)?;
+                    Ok(0usize)
+                })
+            },
+            (_, _) => |_, u: &mut UTCB| {
+                error!(
+                    "Unknown request: badge={}, proto={:#x}, label={:#x}",
+                    badge,
+                    u.get_msg_tag().proto(),
+                    u.get_msg_tag().label()
+                );
+                Err(Error::NotSupported)
+            }
         }
     }
 
@@ -185,17 +286,37 @@ impl<'a> FileSystemService for NexusManager<'a> {
         mode: u32,
     ) -> Result<usize, Error> {
         let (target, sub_path) = self.find_mount(path).ok_or(Error::NotFound)?;
-        FileSystemProxy(target).open(badge, &sub_path, flags, mode)
+        let badged_target = self.mint_badged_endpoint(target, badge)?;
+        if let Some(old) = self.open_routes.insert(badge.bits(), badged_target) {
+            let _ = CSPACE_CAP.delete(old.cap());
+        }
+        let mut client = FsClient::new(badged_target);
+        match client.open(Badge::null(), &sub_path, flags, mode) {
+            Ok(fd) => Ok(fd),
+            Err(e) => {
+                self.open_routes.remove(&badge.bits());
+                let _ = CSPACE_CAP.delete(badged_target.cap());
+                Err(e)
+            }
+        }
     }
 
     fn mkdir(&mut self, badge: Badge, path: &str, mode: u32) -> Result<(), Error> {
         let (target, sub_path) = self.find_mount(path).ok_or(Error::NotFound)?;
-        FileSystemProxy(target).mkdir(badge, &sub_path, mode)
+        let badged_target = self.mint_badged_endpoint(target, badge)?;
+        let mut client = FsClient::new(badged_target);
+        let ret = client.mkdir(Badge::null(), &sub_path, mode);
+        let _ = CSPACE_CAP.delete(badged_target.cap());
+        ret
     }
 
     fn unlink(&mut self, badge: Badge, path: &str) -> Result<(), Error> {
         let (target, sub_path) = self.find_mount(path).ok_or(Error::NotFound)?;
-        FileSystemProxy(target).unlink(badge, &sub_path)
+        let badged_target = self.mint_badged_endpoint(target, badge)?;
+        let mut client = FsClient::new(badged_target);
+        let ret = client.unlink(Badge::null(), &sub_path);
+        let _ = CSPACE_CAP.delete(badged_target.cap());
+        ret
     }
 
     fn rename(&mut self, _badge: Badge, _old_path: &str, _new_path: &str) -> Result<(), Error> {
@@ -204,7 +325,11 @@ impl<'a> FileSystemService for NexusManager<'a> {
 
     fn stat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
         let (target, sub_path) = self.find_mount(path).ok_or(Error::NotFound)?;
-        FileSystemProxy(target).stat_path(badge, &sub_path)
+        let badged_target = self.mint_badged_endpoint(target, badge)?;
+        let mut client = FsClient::new(badged_target);
+        let ret = client.stat_path(Badge::null(), &sub_path);
+        let _ = CSPACE_CAP.delete(badged_target.cap());
+        ret
     }
 }
 
@@ -212,12 +337,13 @@ impl<'a> VirtualFileSystemService for NexusManager<'a> {
     fn mount(&mut self, _badge: Badge, path: &str, target: Endpoint) -> Result<(), Error> {
         log!("Mounting target FS at: {}", path);
         let slot = self.cspace.alloc(self.res_client)?;
-            CSPACE_CAP.transfer_self(target.cap(), slot)?;
+        CSPACE_CAP.transfer_self(target.cap(), slot)?;
         self.mounts.insert(String::from(path), Endpoint::from(slot));
         Ok(())
     }
 
     fn unmount(&mut self, _badge: Badge, path: &str) -> Result<(), Error> {
+        log!("Unmounting FS at: {}", path);
         if let Some(target) = self.mounts.remove(path) {
             let _ = CSPACE_CAP.delete(target.cap());
         }

@@ -18,6 +18,13 @@ impl FileSystemService for FileSystemProxy {
         flags: OpenFlags,
         mode: u32,
     ) -> Result<usize, Error> {
+        log!(
+            "open forward: badge={}, path={}, flags={:?}, mode={:o}",
+            badge.bits(),
+            path,
+            flags,
+            mode
+        );
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.write(path.as_bytes());
@@ -29,6 +36,7 @@ impl FileSystemService for FileSystemProxy {
     }
 
     fn mkdir(&mut self, badge: Badge, path: &str, mode: u32) -> Result<(), Error> {
+        log!("mkdir forward: badge={}, path={}, mode={:o}", badge.bits(), path, mode);
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.write(path.as_bytes());
@@ -44,6 +52,7 @@ impl FileSystemService for FileSystemProxy {
     }
 
     fn unlink(&mut self, badge: Badge, path: &str) -> Result<(), Error> {
+        log!("unlink forward: badge={}, path={}", badge.bits(), path);
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.write(path.as_bytes());
@@ -58,6 +67,12 @@ impl FileSystemService for FileSystemProxy {
     }
 
     fn rename(&mut self, badge: Badge, old_path: &str, new_path: &str) -> Result<(), Error> {
+        log!(
+            "rename forward: badge={}, old_path={}, new_path={}",
+            badge.bits(),
+            old_path,
+            new_path
+        );
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -72,6 +87,7 @@ impl FileSystemService for FileSystemProxy {
     }
 
     fn stat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
+        log!("stat forward: badge={}, path={}", badge.bits(), path);
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.write(path.as_bytes());
