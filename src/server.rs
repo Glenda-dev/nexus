@@ -1,7 +1,7 @@
+use crate::view::View;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::view::View;
 use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply, Rights};
 use glenda::client::{FsClient, InitClient, ResourceClient};
 use glenda::error::Error;
@@ -32,8 +32,11 @@ pub struct NexusManager<'a> {
     views: BTreeMap<usize, View>,
     pid_view_map: BTreeMap<usize, usize>,
     next_view_id: usize,
-    // File-handle route (caller badge -> target FS endpoint)
+    // File-handle route (handle_key=badge>>32 -> target FS endpoint)
     open_routes: BTreeMap<usize, Endpoint>,
+    // Frontend handle endpoint slots returned to callers.
+    open_route_caps: BTreeMap<usize, CapPtr>,
+    next_handle_id: u32,
 
     // Lifecycle
     ipc: NexusIpc,
@@ -57,12 +60,34 @@ impl<'a> NexusManager<'a> {
             pid_view_map: BTreeMap::new(),
             next_view_id: Self::DEFAULT_VIEW_ID + 1,
             open_routes: BTreeMap::new(),
+            open_route_caps: BTreeMap::new(),
+            next_handle_id: 1,
             ipc: NexusIpc {
                 endpoint: None,
                 reply: glenda::cap::REPLY_SLOT,
                 recv: glenda::cap::RECV_SLOT,
             },
         }
+    }
+
+    fn handle_key_from_badge(badge: Badge) -> usize {
+        if usize::BITS > 32 { badge.bits() >> 32 } else { badge.bits() }
+    }
+
+    fn alloc_handle_badge(&mut self, caller_badge: Badge) -> (usize, Badge) {
+        let mut handle_id = self.next_handle_id;
+        if handle_id == 0 {
+            handle_id = 1;
+        }
+        self.next_handle_id = handle_id.wrapping_add(1);
+
+        let composed = if usize::BITS > 32 {
+            let low = caller_badge.bits() & 0xffff_ffffusize;
+            ((handle_id as usize) << 32) | low
+        } else {
+            handle_id as usize
+        };
+        (handle_id as usize, Badge::new(composed))
     }
 
     fn pid_from_badge(badge: Badge) -> usize {
@@ -155,9 +180,8 @@ impl<'a> NexusManager<'a> {
 
     fn find_mount_with_root(&self, badge: Badge, path: &str) -> Option<(String, Endpoint, String)> {
         let view = self.view_for_badge(badge)?;
-        view.find_mount_with_root(path).map(|(m_path, target, sub_path)| {
-            (String::from(m_path), target, sub_path)
-        })
+        view.find_mount_with_root(path)
+            .map(|(m_path, target, sub_path)| (String::from(m_path), target, sub_path))
     }
 
     fn find_mount(&self, badge: Badge, path: &str) -> Option<(Endpoint, String)> {
@@ -236,9 +260,8 @@ impl<'a> NexusManager<'a> {
                 }
 
                 let target = self.readlink_global_path(badge, &prefix)?;
-                let source_mount = self
-                    .find_mount_with_root(badge, &prefix)
-                    .map(|(mount_path, _, _)| mount_path);
+                let source_mount =
+                    self.find_mount_with_root(badge, &prefix).map(|(mount_path, _, _)| mount_path);
                 let parent = Self::parent_dir(&prefix);
                 let mut merged = if target.starts_with('/') {
                     let normalized_target = Self::normalize_absolute_path(&target);
@@ -334,13 +357,20 @@ impl<'a> SystemService for NexusManager<'a> {
         ipc_dispatch! {
             self, utcb,
             (protocol::FS_PROTO, protocol::fs::OPEN) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |u| {
-                    let path = unsafe { u.read_str()? };
-                    let flags = OpenFlags::from_bits_truncate(u.get_mr(0));
-                    let mode = u.get_mr(1) as u32;
-                    let fd = s.open(badge, &path, flags, mode)?;
-                    Ok(fd)
-                })
+                let path = unsafe { u.read_str()? };
+                let flags = OpenFlags::from_bits_truncate(u.get_mr(0));
+                let mode = u.get_mr(1) as u32;
+                let fd = s.open(badge, &path, flags, mode, u.get_recv_window())?;
+                let route_slot = *s.open_route_caps.get(&fd).ok_or(Error::NotFound)?;
+
+                u.set_mr(0, fd);
+                u.set_cap_transfer(route_slot);
+                u.set_msg_tag(MsgTag::new(
+                    protocol::GENERIC_PROTO,
+                    protocol::generic::REPLY,
+                    MsgFlags::OK | MsgFlags::HAS_CAP,
+                ));
+                Ok(())
             },
             (protocol::FS_PROTO, protocol::fs::MKDIR) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
@@ -398,7 +428,8 @@ impl<'a> SystemService for NexusManager<'a> {
                 handle_call(u, |u_inner| {
                     let req_len = u_inner.get_mr(0);
                     let offset = u_inner.get_mr(1);
-                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
                     let mut client = FsClient::new(target);
                     let max_len = core::cmp::min(req_len, u_inner.buffer_mut().len());
                     let read_len = {
@@ -412,7 +443,8 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::WRITE_SYNC) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u_inner| {
                     let offset = u_inner.get_mr(0);
-                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
                     let mut client = FsClient::new(target);
                     let written = client.write(Badge::null(), offset as usize, u_inner.buffer())?;
                     Ok(written)
@@ -420,7 +452,16 @@ impl<'a> SystemService for NexusManager<'a> {
             },
             (protocol::FS_PROTO, protocol::fs::SETUP_IOURING) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u_inner| {
-                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
+                    log!(
+                        "Setup iouring forward: badge={:#x}, handle_key={}, size={}, client_vaddr={:#x}, has_cap={}",
+                        badge.bits(),
+                        handle_key,
+                        u_inner.get_mr(0),
+                        u_inner.get_mr(1),
+                        u_inner.get_msg_tag().flags().contains(MsgFlags::HAS_CAP)
+                    );
                     let mut fwd = unsafe { UTCB::new() };
                     fwd.clear();
 
@@ -435,12 +476,14 @@ impl<'a> SystemService for NexusManager<'a> {
                     fwd.set_mr(2, u_inner.get_mr(2));
                     fwd.set_msg_tag(MsgTag::new(protocol::FS_PROTO, protocol::fs::SETUP_IOURING, flags));
                     target.call(&mut fwd)?;
+                    log!("Setup iouring forward done: badge={:#x}, handle_key={}", badge.bits(), handle_key);
                     Ok(0usize)
                 })
             },
             (protocol::FS_PROTO, protocol::fs::PROCESS_IOURING) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |_u_inner| {
-                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
                     let mut fwd = unsafe { UTCB::new() };
                     fwd.clear();
                     fwd.set_msg_tag(MsgTag::new(protocol::FS_PROTO, protocol::fs::PROCESS_IOURING, MsgFlags::NONE));
@@ -450,16 +493,23 @@ impl<'a> SystemService for NexusManager<'a> {
             },
             (protocol::FS_PROTO, protocol::fs::CLOSE) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |_u_inner| {
-                    let target = s.open_routes.remove(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = s.open_routes.remove(&handle_key).ok_or(Error::NotFound)?;
                     let mut client = FsClient::new(target);
                     client.close(Badge::null())?;
                     let _ = CSPACE_CAP.delete(target.cap());
+                    s.cspace.free(target.cap());
+                    if let Some(route_slot) = s.open_route_caps.remove(&handle_key) {
+                        let _ = CSPACE_CAP.delete(route_slot);
+                        s.cspace.free(route_slot);
+                    }
                     Ok(0usize)
                 })
             },
             (protocol::FS_PROTO, protocol::fs::STAT) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u_inner| {
-                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
                     let client = FsClient::new(target);
                     let stat = client.stat(Badge::null())?;
                     unsafe { u_inner.write_obj(&stat)? };
@@ -484,7 +534,8 @@ impl<'a> SystemService for NexusManager<'a> {
             },
             (protocol::FS_PROTO, protocol::fs::GETDENTS) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u_inner| {
-                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
                     let count = u_inner.get_mr(0);
                     let mut client = FsClient::new(target);
                     let entries = client.getdents(Badge::null(), count)?;
@@ -494,7 +545,8 @@ impl<'a> SystemService for NexusManager<'a> {
             },
             (protocol::FS_PROTO, protocol::fs::SEEK) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u_inner| {
-                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
                     let offset = u_inner.get_mr(0) as i64;
                     let whence = u_inner.get_mr(1);
                     let mut client = FsClient::new(target);
@@ -504,7 +556,8 @@ impl<'a> SystemService for NexusManager<'a> {
             },
             (protocol::FS_PROTO, protocol::fs::SYNC) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |_u_inner| {
-                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
                     let mut client = FsClient::new(target);
                     client.sync(Badge::null())?;
                     Ok(0usize)
@@ -512,7 +565,8 @@ impl<'a> SystemService for NexusManager<'a> {
             },
             (protocol::FS_PROTO, protocol::fs::TRUNCATE) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u_inner| {
-                    let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
+                    let handle_key = Self::handle_key_from_badge(badge);
+                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
                     let size = u_inner.get_mr(0);
                     let mut client = FsClient::new(target);
                     client.truncate(Badge::null(), size)?;
@@ -547,25 +601,70 @@ impl<'a> FileSystemService for NexusManager<'a> {
         path: &str,
         flags: OpenFlags,
         mode: u32,
+        _recv_slot: CapPtr,
     ) -> Result<usize, Error> {
+        log!("Open request: badge={}, path={}, flags={:?}, mode={:#o}", badge, path, flags, mode);
         let resolved = self.resolve_global_path(badge, path, true)?;
         let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
-        let badged_target = self.mint_badged_endpoint(target, badge)?;
-        if let Some(old) = self.open_routes.insert(badge.bits(), badged_target) {
-            let _ = CSPACE_CAP.delete(old.cap());
+        let (handle_id, handle_badge) = self.alloc_handle_badge(badge);
+        log!(
+            "Open routing: caller_badge={}, handle_id={}, handle_badge={:#x}, resolved={}, sub_path={}",
+            badge,
+            handle_id,
+            handle_badge.bits(),
+            resolved,
+            sub_path
+        );
+
+        // 给后端文件系统一个按 handle_badge 隔离的 endpoint，随后走默认 open()。
+        let backend_handle_ep = self.mint_badged_endpoint(target, handle_badge)?;
+        let mut backend_client = FsClient::new(backend_handle_ep);
+        if let Err(e) = backend_client.open(Badge::null(), &sub_path, flags, mode, CapPtr::null()) {
+            let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
+            self.cspace.free(backend_handle_ep.cap());
+            return Err(e);
         }
-        let mut client = FsClient::new(badged_target);
-        match client.open(Badge::null(), &sub_path, flags, mode) {
-            Ok(fd) => Ok(fd),
+
+        let frontend_slot = match self.cspace.alloc(self.res_client) {
+            Ok(slot) => slot,
             Err(e) => {
-                self.open_routes.remove(&badge.bits());
-                let _ = CSPACE_CAP.delete(badged_target.cap());
-                Err(e)
+                let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
+                self.cspace.free(backend_handle_ep.cap());
+                return Err(e);
             }
+        };
+        let frontend_ep = self.ipc.endpoint.ok_or(Error::NotInitialized)?;
+        if let Err(e) =
+            CSPACE_CAP.mint_self(frontend_ep.cap(), frontend_slot, handle_badge, Rights::ALL)
+        {
+            let _ = CSPACE_CAP.delete(frontend_slot);
+            self.cspace.free(frontend_slot);
+            let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
+            self.cspace.free(backend_handle_ep.cap());
+            return Err(e);
         }
+
+        if let Some(old) = self.open_routes.insert(handle_id, backend_handle_ep) {
+            let _ = CSPACE_CAP.delete(old.cap());
+            self.cspace.free(old.cap());
+        }
+        if let Some(old_slot) = self.open_route_caps.insert(handle_id, frontend_slot) {
+            let _ = CSPACE_CAP.delete(old_slot);
+            self.cspace.free(old_slot);
+        }
+
+        log!(
+            "Open route ready: handle_id={}, backend_ep={:?}, frontend_slot={:?}",
+            handle_id,
+            backend_handle_ep,
+            frontend_slot
+        );
+
+        Ok(handle_id)
     }
 
     fn mkdir(&mut self, badge: Badge, path: &str, mode: u32) -> Result<(), Error> {
+        log!("Mkdir request: badge={}, path={}, mode={:#o}", badge, path, mode);
         let normalized = Self::normalize_absolute_path(path);
         let (parent, name) = Self::split_parent_name(&normalized)?;
         let resolved_parent = self.resolve_global_path(badge, &parent, true)?;
@@ -580,6 +679,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
     }
 
     fn unlink(&mut self, badge: Badge, path: &str) -> Result<(), Error> {
+        log!("Unlink request: badge={}, path={}", badge, path);
         let resolved = self.resolve_global_path(badge, path, false)?;
         let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
@@ -590,10 +690,12 @@ impl<'a> FileSystemService for NexusManager<'a> {
     }
 
     fn rename(&mut self, _badge: Badge, _old_path: &str, _new_path: &str) -> Result<(), Error> {
+        log!("Rename request: badge={}, old_path={}, new_path={}", _badge, _old_path, _new_path);
         Err(Error::NotSupported)
     }
 
     fn stat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
+        log!("Stat request: badge={}, path={}", badge, path);
         let resolved = self.resolve_global_path(badge, path, true)?;
         let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
@@ -604,6 +706,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
     }
 
     fn lstat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
+        log!("Lstat request: badge={}, path={}", badge, path);
         let resolved = self.resolve_global_path(badge, path, false)?;
         let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
@@ -614,6 +717,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
     }
 
     fn readlink_path(&mut self, badge: Badge, path: &str) -> Result<String, Error> {
+        log!("Readlink request: badge={}, path={}", badge, path);
         let resolved = self.resolve_global_path(badge, path, false)?;
         let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
@@ -626,8 +730,8 @@ impl<'a> FileSystemService for NexusManager<'a> {
 
 impl<'a> VirtualFileSystemService for NexusManager<'a> {
     fn mount(&mut self, badge: Badge, path: &str, target: Endpoint) -> Result<(), Error> {
+        log!("Mount request: badge={}, path={}, target={:?}", badge, path, target);
         let normalized = Self::normalize_absolute_path(path);
-        log!("Mounting target FS at: {}", normalized);
         let slot = self.cspace.alloc(self.res_client)?;
         CSPACE_CAP.transfer_self(target.cap(), slot)?;
         self.view_for_badge_mut(badge)?.mounts.insert(normalized, Endpoint::from(slot));
@@ -635,6 +739,7 @@ impl<'a> VirtualFileSystemService for NexusManager<'a> {
     }
 
     fn unmount(&mut self, badge: Badge, path: &str) -> Result<(), Error> {
+        log!("Unmount request: badge={}, path={}", badge, path);
         let normalized = Self::normalize_absolute_path(path);
         log!("Unmounting FS at: {}", normalized);
         if let Some(target) = self.view_for_badge_mut(badge)?.mounts.remove(&normalized) {
@@ -644,6 +749,7 @@ impl<'a> VirtualFileSystemService for NexusManager<'a> {
     }
 
     fn create_view(&mut self, badge: Badge, root: &str) -> Result<usize, Error> {
+        log!("Create view request: badge={}, root={}", badge, root);
         let pid = Self::pid_from_badge(badge);
         let source_view_id = self.view_id_for_pid(pid);
         let source_view = self
@@ -659,6 +765,7 @@ impl<'a> VirtualFileSystemService for NexusManager<'a> {
     }
 
     fn set_view(&mut self, badge: Badge, view_id: usize) -> Result<(), Error> {
+        log!("Set view request: badge={}, view_id={}", badge, view_id);
         if !self.views.contains_key(&view_id) {
             return Err(Error::NotFound);
         }

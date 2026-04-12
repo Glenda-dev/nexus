@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use glenda::cap::Endpoint;
+use glenda::cap::{CapPtr, Endpoint};
 use glenda::error::Error;
 use glenda::interface::fs::{FileHandleService, FileSystemService};
 use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
@@ -18,6 +18,7 @@ impl FileSystemService for FileSystemProxy {
         path: &str,
         flags: OpenFlags,
         mode: u32,
+        recv_slot: CapPtr,
     ) -> Result<usize, Error> {
         log!(
             "open forward: badge={}, path={}, flags={:?}, mode={:o}",
@@ -31,6 +32,7 @@ impl FileSystemService for FileSystemProxy {
         utcb.write(path.as_bytes());
         utcb.set_badge(badge);
         set_mrs!(utcb, flags.bits(), mode);
+        utcb.set_recv_window(recv_slot);
         utcb.set_msg_tag(MsgTag::new(protocol::FS_PROTO, protocol::fs::OPEN, MsgFlags::HAS_BUFFER));
         self.0.proxy(utcb)?;
         Err(Error::Success) // Signal that we have proxied and don't need to reply
@@ -135,6 +137,7 @@ impl FileSystemService for FileSystemProxy {
 
 impl FileHandleService for FileHandleProxy {
     fn close(&mut self, badge: Badge) -> Result<(), Error> {
+        log!("close forward: badge={}", badge.bits());
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -144,6 +147,7 @@ impl FileHandleService for FileHandleProxy {
     }
 
     fn stat(&self, badge: Badge) -> Result<Stat, Error> {
+        log!("stat forward: badge={}", badge.bits());
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -153,6 +157,7 @@ impl FileHandleService for FileHandleProxy {
     }
 
     fn read(&mut self, badge: Badge, offset: usize, buf: &mut [u8]) -> Result<usize, Error> {
+        log!("read forward: badge={}, offset={}, buf_len={}", badge.bits(), offset, buf.len());
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -163,6 +168,7 @@ impl FileHandleService for FileHandleProxy {
     }
 
     fn write(&mut self, badge: Badge, offset: usize, buf: &[u8]) -> Result<usize, Error> {
+        log!("write forward: badge={}, offset={}, buf_len={}", badge.bits(), offset, buf.len());
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -178,6 +184,7 @@ impl FileHandleService for FileHandleProxy {
     }
 
     fn getdents(&mut self, badge: Badge, count: usize) -> Result<Vec<DEntry>, Error> {
+        log!("getdents forward: badge={}, count={}", badge.bits(), count);
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -188,6 +195,7 @@ impl FileHandleService for FileHandleProxy {
     }
 
     fn seek(&mut self, badge: Badge, offset: i64, whence: usize) -> Result<usize, Error> {
+        log!("seek forward: badge={}, offset={}, whence={}", badge.bits(), offset, whence);
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -198,6 +206,7 @@ impl FileHandleService for FileHandleProxy {
     }
 
     fn sync(&mut self, badge: Badge) -> Result<(), Error> {
+        log!("sync forward: badge={}", badge.bits());
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
@@ -207,6 +216,7 @@ impl FileHandleService for FileHandleProxy {
     }
 
     fn truncate(&mut self, badge: Badge, size: usize) -> Result<(), Error> {
+        log!("truncate forward: badge={}, size={}", badge.bits(), size);
         let utcb = unsafe { UTCB::new() };
         utcb.clear();
         utcb.set_badge(badge);
