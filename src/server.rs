@@ -1,5 +1,6 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec::Vec;
 use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply, Rights};
 use glenda::client::{FsClient, InitClient, ResourceClient};
 use glenda::error::Error;
@@ -36,6 +37,10 @@ pub struct NexusManager<'a> {
 }
 
 impl<'a> NexusManager<'a> {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFLNK: u32 = 0o120000;
+    const MAX_SYMLINK_DEPTH: usize = 40;
+
     pub fn new(res_client: &'a mut ResourceClient, init_client: &'a mut InitClient) -> Self {
         Self {
             res_client,
@@ -51,10 +56,99 @@ impl<'a> NexusManager<'a> {
         }
     }
 
+    fn normalize_absolute_path(path: &str) -> String {
+        let src = if path.is_empty() { "/" } else { path };
+        let mut stack: Vec<&str> = Vec::new();
+        for part in src.split('/') {
+            if part.is_empty() || part == "." {
+                continue;
+            }
+            if part == ".." {
+                let _ = stack.pop();
+                continue;
+            }
+            stack.push(part);
+        }
+
+        if stack.is_empty() {
+            return String::from("/");
+        }
+
+        let mut out = String::new();
+        for part in stack {
+            out.push('/');
+            out.push_str(part);
+        }
+        out
+    }
+
+    fn join_components(parts: &[&str]) -> String {
+        let mut out = String::new();
+        for (idx, part) in parts.iter().enumerate() {
+            if idx > 0 {
+                out.push('/');
+            }
+            out.push_str(part);
+        }
+        out
+    }
+
+    fn parent_dir(path: &str) -> String {
+        let normalized = Self::normalize_absolute_path(path);
+        if normalized == "/" {
+            return normalized;
+        }
+        if let Some(pos) = normalized.rfind('/') {
+            if pos == 0 {
+                return String::from("/");
+            }
+            return String::from(&normalized[..pos]);
+        }
+        String::from("/")
+    }
+
+    fn join_paths(base: &str, tail: &str) -> String {
+        if tail.starts_with('/') {
+            return Self::normalize_absolute_path(tail);
+        }
+        let mut out = String::from(base);
+        if !out.ends_with('/') {
+            out.push('/');
+        }
+        out.push_str(tail);
+        Self::normalize_absolute_path(&out)
+    }
+
+    fn split_parent_name(path: &str) -> Result<(String, String), Error> {
+        let normalized = Self::normalize_absolute_path(path);
+        if normalized == "/" {
+            return Err(Error::InvalidArgs);
+        }
+        let slash = normalized.rfind('/').ok_or(Error::InvalidArgs)?;
+        let parent =
+            if slash == 0 { String::from("/") } else { String::from(&normalized[..slash]) };
+        let name = String::from(&normalized[slash + 1..]);
+        if name.is_empty() {
+            return Err(Error::InvalidArgs);
+        }
+        Ok((parent, name))
+    }
+
+    fn is_symlink_mode(mode: u32) -> bool {
+        (mode & Self::S_IFMT) == Self::S_IFLNK
+    }
+
     fn find_mount(&self, path: &str) -> Option<(Endpoint, String)> {
         let mut best_match: Option<(&String, &Endpoint)> = None;
         for (m_path, target) in &self.mounts {
-            if path.starts_with(m_path) {
+            let matched = if m_path == "/" {
+                path.starts_with('/')
+            } else {
+                path == m_path
+                    || (path.starts_with(m_path)
+                        && path.as_bytes().get(m_path.len()).map(|b| *b == b'/').unwrap_or(false))
+            };
+            if matched {
                 if best_match.is_none() || m_path.len() > best_match.unwrap().0.len() {
                     best_match = Some((m_path, target));
                 }
@@ -74,6 +168,95 @@ impl<'a> NexusManager<'a> {
         let slot = self.cspace.alloc(self.res_client)?;
         CSPACE_CAP.mint_self(target.cap(), slot, badge, Rights::ALL)?;
         Ok(Endpoint::from(slot))
+    }
+
+    fn lstat_global_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
+        let normalized = Self::normalize_absolute_path(path);
+        let (target, sub_path) = self.find_mount(&normalized).ok_or(Error::NotFound)?;
+        let badged_target = self.mint_badged_endpoint(target, badge)?;
+        let mut client = FsClient::new(badged_target);
+        let ret = match client.lstat_path(Badge::null(), &sub_path) {
+            Ok(stat) => Ok(stat),
+            Err(Error::NotSupported) => client.stat_path(Badge::null(), &sub_path),
+            Err(e) => Err(e),
+        };
+        let _ = CSPACE_CAP.delete(badged_target.cap());
+        ret
+    }
+
+    fn readlink_global_path(&mut self, badge: Badge, path: &str) -> Result<String, Error> {
+        let normalized = Self::normalize_absolute_path(path);
+        let (target, sub_path) = self.find_mount(&normalized).ok_or(Error::NotFound)?;
+        let badged_target = self.mint_badged_endpoint(target, badge)?;
+        let mut client = FsClient::new(badged_target);
+        let ret = client.readlink_path(Badge::null(), &sub_path);
+        let _ = CSPACE_CAP.delete(badged_target.cap());
+        ret
+    }
+
+    fn resolve_global_path(
+        &mut self,
+        badge: Badge,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<String, Error> {
+        let mut current = Self::normalize_absolute_path(path);
+        let mut followed = 0usize;
+
+        loop {
+            let components: Vec<&str> =
+                current.split('/').filter(|part| !part.is_empty() && *part != ".").collect();
+
+            if components.is_empty() {
+                return Ok(String::from("/"));
+            }
+
+            let mut prefix = String::from("/");
+            let mut replaced = false;
+
+            for (idx, part) in components.iter().enumerate() {
+                if prefix.len() > 1 {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+
+                let is_last = idx + 1 == components.len();
+                if is_last && !follow_final {
+                    continue;
+                }
+
+                let st = self.lstat_global_path(badge, &prefix)?;
+                if !Self::is_symlink_mode(st.mode) {
+                    continue;
+                }
+
+                followed += 1;
+                if followed > Self::MAX_SYMLINK_DEPTH {
+                    return Err(Error::ResourceBusy);
+                }
+
+                let target = self.readlink_global_path(badge, &prefix)?;
+                let parent = Self::parent_dir(&prefix);
+                let mut merged = if target.starts_with('/') {
+                    Self::normalize_absolute_path(&target)
+                } else {
+                    Self::join_paths(&parent, &target)
+                };
+
+                if !is_last {
+                    let rest = Self::join_components(&components[idx + 1..]);
+                    merged = Self::join_paths(&merged, &rest);
+                }
+
+                current = merged;
+                replaced = true;
+                break;
+            }
+
+            if !replaced {
+                return Ok(current);
+            }
+        }
     }
 }
 
@@ -251,6 +434,22 @@ impl<'a> SystemService for NexusManager<'a> {
                     Ok(0usize)
                 })
             },
+            (protocol::FS_PROTO, protocol::fs::LSTAT_PATH) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u| {
+                    let path = unsafe { u.read_str()? };
+                    let stat = s.lstat_path(badge, &path)?;
+                    unsafe { u.write_obj(&stat)? };
+                    Ok(0usize)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::READLINK_PATH) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u| {
+                    let path = unsafe { u.read_str()? };
+                    let target = s.readlink_path(badge, &path)?;
+                    unsafe { u.write_str(&target)? };
+                    Ok(0usize)
+                })
+            },
             (protocol::FS_PROTO, protocol::fs::GETDENTS) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u_inner| {
                     let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
@@ -317,7 +516,8 @@ impl<'a> FileSystemService for NexusManager<'a> {
         flags: OpenFlags,
         mode: u32,
     ) -> Result<usize, Error> {
-        let (target, sub_path) = self.find_mount(path).ok_or(Error::NotFound)?;
+        let resolved = self.resolve_global_path(badge, path, true)?;
+        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         if let Some(old) = self.open_routes.insert(badge.bits(), badged_target) {
             let _ = CSPACE_CAP.delete(old.cap());
@@ -334,7 +534,12 @@ impl<'a> FileSystemService for NexusManager<'a> {
     }
 
     fn mkdir(&mut self, badge: Badge, path: &str, mode: u32) -> Result<(), Error> {
-        let (target, sub_path) = self.find_mount(path).ok_or(Error::NotFound)?;
+        let normalized = Self::normalize_absolute_path(path);
+        let (parent, name) = Self::split_parent_name(&normalized)?;
+        let resolved_parent = self.resolve_global_path(badge, &parent, true)?;
+        let target_path = Self::join_paths(&resolved_parent, &name);
+
+        let (target, sub_path) = self.find_mount(&target_path).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = client.mkdir(Badge::null(), &sub_path, mode);
@@ -343,7 +548,8 @@ impl<'a> FileSystemService for NexusManager<'a> {
     }
 
     fn unlink(&mut self, badge: Badge, path: &str) -> Result<(), Error> {
-        let (target, sub_path) = self.find_mount(path).ok_or(Error::NotFound)?;
+        let resolved = self.resolve_global_path(badge, path, false)?;
+        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = client.unlink(Badge::null(), &sub_path);
@@ -356,10 +562,31 @@ impl<'a> FileSystemService for NexusManager<'a> {
     }
 
     fn stat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
-        let (target, sub_path) = self.find_mount(path).ok_or(Error::NotFound)?;
+        let resolved = self.resolve_global_path(badge, path, true)?;
+        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = client.stat_path(Badge::null(), &sub_path);
+        let _ = CSPACE_CAP.delete(badged_target.cap());
+        ret
+    }
+
+    fn lstat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
+        let resolved = self.resolve_global_path(badge, path, false)?;
+        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
+        let badged_target = self.mint_badged_endpoint(target, badge)?;
+        let mut client = FsClient::new(badged_target);
+        let ret = client.lstat_path(Badge::null(), &sub_path);
+        let _ = CSPACE_CAP.delete(badged_target.cap());
+        ret
+    }
+
+    fn readlink_path(&mut self, badge: Badge, path: &str) -> Result<String, Error> {
+        let resolved = self.resolve_global_path(badge, path, false)?;
+        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
+        let badged_target = self.mint_badged_endpoint(target, badge)?;
+        let mut client = FsClient::new(badged_target);
+        let ret = client.readlink_path(Badge::null(), &sub_path);
         let _ = CSPACE_CAP.delete(badged_target.cap());
         ret
     }
@@ -367,16 +594,18 @@ impl<'a> FileSystemService for NexusManager<'a> {
 
 impl<'a> VirtualFileSystemService for NexusManager<'a> {
     fn mount(&mut self, _badge: Badge, path: &str, target: Endpoint) -> Result<(), Error> {
-        log!("Mounting target FS at: {}", path);
+        let normalized = Self::normalize_absolute_path(path);
+        log!("Mounting target FS at: {}", normalized);
         let slot = self.cspace.alloc(self.res_client)?;
         CSPACE_CAP.transfer_self(target.cap(), slot)?;
-        self.mounts.insert(String::from(path), Endpoint::from(slot));
+        self.mounts.insert(normalized, Endpoint::from(slot));
         Ok(())
     }
 
     fn unmount(&mut self, _badge: Badge, path: &str) -> Result<(), Error> {
-        log!("Unmounting FS at: {}", path);
-        if let Some(target) = self.mounts.remove(path) {
+        let normalized = Self::normalize_absolute_path(path);
+        log!("Unmounting FS at: {}", normalized);
+        if let Some(target) = self.mounts.remove(&normalized) {
             let _ = CSPACE_CAP.delete(target.cap());
         }
         Ok(())

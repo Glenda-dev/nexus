@@ -1,3 +1,4 @@
+use alloc::string::String;
 use alloc::vec::Vec;
 use glenda::cap::Endpoint;
 use glenda::error::Error;
@@ -95,6 +96,36 @@ impl FileSystemService for FileSystemProxy {
         utcb.set_msg_tag(MsgTag::new(
             protocol::FS_PROTO,
             protocol::fs::STAT_PATH,
+            MsgFlags::HAS_BUFFER,
+        ));
+        self.0.proxy(utcb)?;
+        Err(Error::Success)
+    }
+
+    fn lstat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
+        log!("lstat forward: badge={}, path={}", badge.bits(), path);
+        let utcb = unsafe { UTCB::new() };
+        utcb.clear();
+        utcb.write(path.as_bytes());
+        utcb.set_badge(badge);
+        utcb.set_msg_tag(MsgTag::new(
+            protocol::FS_PROTO,
+            protocol::fs::LSTAT_PATH,
+            MsgFlags::HAS_BUFFER,
+        ));
+        self.0.proxy(utcb)?;
+        Err(Error::Success)
+    }
+
+    fn readlink_path(&mut self, badge: Badge, path: &str) -> Result<String, Error> {
+        log!("readlink forward: badge={}, path={}", badge.bits(), path);
+        let utcb = unsafe { UTCB::new() };
+        utcb.clear();
+        utcb.write(path.as_bytes());
+        utcb.set_badge(badge);
+        utcb.set_msg_tag(MsgTag::new(
+            protocol::FS_PROTO,
+            protocol::fs::READLINK_PATH,
             MsgFlags::HAS_BUFFER,
         ));
         self.0.proxy(utcb)?;
