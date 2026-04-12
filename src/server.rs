@@ -1,6 +1,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use crate::view::View;
 use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply, Rights};
 use glenda::client::{FsClient, InitClient, ResourceClient};
 use glenda::error::Error;
@@ -27,8 +28,10 @@ pub struct NexusManager<'a> {
     // CSpace Management
     cspace: CSpaceManager,
 
-    // Namespace Management (Path -> Target FS Endpoint)
-    mounts: BTreeMap<String, Endpoint>,
+    // View Management
+    views: BTreeMap<usize, View>,
+    pid_view_map: BTreeMap<usize, usize>,
+    next_view_id: usize,
     // File-handle route (caller badge -> target FS endpoint)
     open_routes: BTreeMap<usize, Endpoint>,
 
@@ -37,16 +40,22 @@ pub struct NexusManager<'a> {
 }
 
 impl<'a> NexusManager<'a> {
+    const DEFAULT_VIEW_ID: usize = 0;
     const S_IFMT: u32 = 0o170000;
     const S_IFLNK: u32 = 0o120000;
     const MAX_SYMLINK_DEPTH: usize = 40;
 
     pub fn new(res_client: &'a mut ResourceClient, init_client: &'a mut InitClient) -> Self {
+        let mut views = BTreeMap::new();
+        views.insert(Self::DEFAULT_VIEW_ID, View::new("/"));
+
         Self {
             res_client,
             init_client,
             cspace: CSpaceManager::new(CSPACE_CAP, 16),
-            mounts: BTreeMap::new(),
+            views,
+            pid_view_map: BTreeMap::new(),
+            next_view_id: Self::DEFAULT_VIEW_ID + 1,
             open_routes: BTreeMap::new(),
             ipc: NexusIpc {
                 endpoint: None,
@@ -56,30 +65,36 @@ impl<'a> NexusManager<'a> {
         }
     }
 
+    fn pid_from_badge(badge: Badge) -> usize {
+        badge.bits()
+    }
+
+    fn view_id_for_pid(&self, pid: usize) -> usize {
+        self.pid_view_map.get(&pid).copied().unwrap_or(Self::DEFAULT_VIEW_ID)
+    }
+
+    fn view_for_badge(&self, badge: Badge) -> Option<&View> {
+        let pid = Self::pid_from_badge(badge);
+        let view_id = self.view_id_for_pid(pid);
+        self.views.get(&view_id).or_else(|| self.views.get(&Self::DEFAULT_VIEW_ID))
+    }
+
+    fn view_for_badge_mut(&mut self, badge: Badge) -> Result<&mut View, Error> {
+        let pid = Self::pid_from_badge(badge);
+        let view_id = self.view_id_for_pid(pid);
+        let target_view_id =
+            if self.views.contains_key(&view_id) { view_id } else { Self::DEFAULT_VIEW_ID };
+        self.pid_view_map.insert(pid, target_view_id);
+        self.views.get_mut(&target_view_id).ok_or(Error::NotFound)
+    }
+
     fn normalize_absolute_path(path: &str) -> String {
-        let src = if path.is_empty() { "/" } else { path };
-        let mut stack: Vec<&str> = Vec::new();
-        for part in src.split('/') {
-            if part.is_empty() || part == "." {
-                continue;
-            }
-            if part == ".." {
-                let _ = stack.pop();
-                continue;
-            }
-            stack.push(part);
-        }
+        View::normalize_absolute_path(path)
+    }
 
-        if stack.is_empty() {
-            return String::from("/");
-        }
-
-        let mut out = String::new();
-        for part in stack {
-            out.push('/');
-            out.push_str(part);
-        }
-        out
+    fn view_path_to_global(&self, badge: Badge, path: &str) -> Result<String, Error> {
+        let view = self.view_for_badge(badge).ok_or(Error::NotFound)?;
+        Ok(view.map_path_into_view_root(path))
     }
 
     fn join_components(parts: &[&str]) -> String {
@@ -138,30 +153,15 @@ impl<'a> NexusManager<'a> {
         (mode & Self::S_IFMT) == Self::S_IFLNK
     }
 
-    fn find_mount(&self, path: &str) -> Option<(Endpoint, String)> {
-        let mut best_match: Option<(&String, &Endpoint)> = None;
-        for (m_path, target) in &self.mounts {
-            let matched = if m_path == "/" {
-                path.starts_with('/')
-            } else {
-                path == m_path
-                    || (path.starts_with(m_path)
-                        && path.as_bytes().get(m_path.len()).map(|b| *b == b'/').unwrap_or(false))
-            };
-            if matched {
-                if best_match.is_none() || m_path.len() > best_match.unwrap().0.len() {
-                    best_match = Some((m_path, target));
-                }
-            }
-        }
-
-        best_match.map(|(m_path, target)| {
-            let mut sub_path = &path[m_path.len()..];
-            if sub_path.is_empty() {
-                sub_path = "/";
-            }
-            (*target, String::from(sub_path))
+    fn find_mount_with_root(&self, badge: Badge, path: &str) -> Option<(String, Endpoint, String)> {
+        let view = self.view_for_badge(badge)?;
+        view.find_mount_with_root(path).map(|(m_path, target, sub_path)| {
+            (String::from(m_path), target, sub_path)
         })
+    }
+
+    fn find_mount(&self, badge: Badge, path: &str) -> Option<(Endpoint, String)> {
+        self.find_mount_with_root(badge, path).map(|(_, target, sub_path)| (target, sub_path))
     }
 
     fn mint_badged_endpoint(&mut self, target: Endpoint, badge: Badge) -> Result<Endpoint, Error> {
@@ -172,7 +172,7 @@ impl<'a> NexusManager<'a> {
 
     fn lstat_global_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
         let normalized = Self::normalize_absolute_path(path);
-        let (target, sub_path) = self.find_mount(&normalized).ok_or(Error::NotFound)?;
+        let (target, sub_path) = self.find_mount(badge, &normalized).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = match client.lstat_path(Badge::null(), &sub_path) {
@@ -186,7 +186,7 @@ impl<'a> NexusManager<'a> {
 
     fn readlink_global_path(&mut self, badge: Badge, path: &str) -> Result<String, Error> {
         let normalized = Self::normalize_absolute_path(path);
-        let (target, sub_path) = self.find_mount(&normalized).ok_or(Error::NotFound)?;
+        let (target, sub_path) = self.find_mount(badge, &normalized).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = client.readlink_path(Badge::null(), &sub_path);
@@ -200,7 +200,7 @@ impl<'a> NexusManager<'a> {
         path: &str,
         follow_final: bool,
     ) -> Result<String, Error> {
-        let mut current = Self::normalize_absolute_path(path);
+        let mut current = self.view_path_to_global(badge, path)?;
         let mut followed = 0usize;
 
         loop {
@@ -236,9 +236,27 @@ impl<'a> NexusManager<'a> {
                 }
 
                 let target = self.readlink_global_path(badge, &prefix)?;
+                let source_mount = self
+                    .find_mount_with_root(badge, &prefix)
+                    .map(|(mount_path, _, _)| mount_path);
                 let parent = Self::parent_dir(&prefix);
                 let mut merged = if target.starts_with('/') {
-                    Self::normalize_absolute_path(&target)
+                    let normalized_target = Self::normalize_absolute_path(&target);
+                    if self.find_mount(badge, &normalized_target).is_some() {
+                        normalized_target
+                    } else if let Some(mount_path) = source_mount.as_deref() {
+                        if mount_path != "/" {
+                            let mut remapped = String::from(mount_path);
+                            if normalized_target != "/" {
+                                remapped.push_str(&normalized_target);
+                            }
+                            Self::normalize_absolute_path(&remapped)
+                        } else {
+                            normalized_target
+                        }
+                    } else {
+                        normalized_target
+                    }
                 } else {
                     Self::join_paths(&parent, &target)
                 };
@@ -360,6 +378,20 @@ impl<'a> SystemService for NexusManager<'a> {
                     let path = unsafe { u.read_str()? };
                     s.unmount(badge, &path)?;
                     Ok(())
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::CREATE_VIEW) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u| {
+                    let root = unsafe { u.read_str()? };
+                    let view_id = s.create_view(badge, &root)?;
+                    Ok(view_id)
+                })
+            },
+            (protocol::FS_PROTO, protocol::fs::SET_VIEW) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u| {
+                    let view_id = u.get_mr(0);
+                    s.set_view(badge, view_id)?;
+                    Ok(0usize)
                 })
             },
             (protocol::FS_PROTO, protocol::fs::READ_SYNC) => |s: &mut Self, u: &mut UTCB| {
@@ -517,7 +549,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
         mode: u32,
     ) -> Result<usize, Error> {
         let resolved = self.resolve_global_path(badge, path, true)?;
-        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
+        let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         if let Some(old) = self.open_routes.insert(badge.bits(), badged_target) {
             let _ = CSPACE_CAP.delete(old.cap());
@@ -539,7 +571,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
         let resolved_parent = self.resolve_global_path(badge, &parent, true)?;
         let target_path = Self::join_paths(&resolved_parent, &name);
 
-        let (target, sub_path) = self.find_mount(&target_path).ok_or(Error::NotFound)?;
+        let (target, sub_path) = self.find_mount(badge, &target_path).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = client.mkdir(Badge::null(), &sub_path, mode);
@@ -549,7 +581,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
 
     fn unlink(&mut self, badge: Badge, path: &str) -> Result<(), Error> {
         let resolved = self.resolve_global_path(badge, path, false)?;
-        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
+        let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = client.unlink(Badge::null(), &sub_path);
@@ -563,7 +595,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
 
     fn stat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
         let resolved = self.resolve_global_path(badge, path, true)?;
-        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
+        let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = client.stat_path(Badge::null(), &sub_path);
@@ -573,7 +605,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
 
     fn lstat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
         let resolved = self.resolve_global_path(badge, path, false)?;
-        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
+        let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = client.lstat_path(Badge::null(), &sub_path);
@@ -583,7 +615,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
 
     fn readlink_path(&mut self, badge: Badge, path: &str) -> Result<String, Error> {
         let resolved = self.resolve_global_path(badge, path, false)?;
-        let (target, sub_path) = self.find_mount(&resolved).ok_or(Error::NotFound)?;
+        let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
         let badged_target = self.mint_badged_endpoint(target, badge)?;
         let mut client = FsClient::new(badged_target);
         let ret = client.readlink_path(Badge::null(), &sub_path);
@@ -593,21 +625,45 @@ impl<'a> FileSystemService for NexusManager<'a> {
 }
 
 impl<'a> VirtualFileSystemService for NexusManager<'a> {
-    fn mount(&mut self, _badge: Badge, path: &str, target: Endpoint) -> Result<(), Error> {
+    fn mount(&mut self, badge: Badge, path: &str, target: Endpoint) -> Result<(), Error> {
         let normalized = Self::normalize_absolute_path(path);
         log!("Mounting target FS at: {}", normalized);
         let slot = self.cspace.alloc(self.res_client)?;
         CSPACE_CAP.transfer_self(target.cap(), slot)?;
-        self.mounts.insert(normalized, Endpoint::from(slot));
+        self.view_for_badge_mut(badge)?.mounts.insert(normalized, Endpoint::from(slot));
         Ok(())
     }
 
-    fn unmount(&mut self, _badge: Badge, path: &str) -> Result<(), Error> {
+    fn unmount(&mut self, badge: Badge, path: &str) -> Result<(), Error> {
         let normalized = Self::normalize_absolute_path(path);
         log!("Unmounting FS at: {}", normalized);
-        if let Some(target) = self.mounts.remove(&normalized) {
+        if let Some(target) = self.view_for_badge_mut(badge)?.mounts.remove(&normalized) {
             let _ = CSPACE_CAP.delete(target.cap());
         }
+        Ok(())
+    }
+
+    fn create_view(&mut self, badge: Badge, root: &str) -> Result<usize, Error> {
+        let pid = Self::pid_from_badge(badge);
+        let source_view_id = self.view_id_for_pid(pid);
+        let source_view = self
+            .views
+            .get(&source_view_id)
+            .or_else(|| self.views.get(&Self::DEFAULT_VIEW_ID))
+            .ok_or(Error::NotFound)?;
+        let view_id = self.next_view_id;
+        self.next_view_id = self.next_view_id.wrapping_add(1);
+        let new_view = source_view.clone_with_root(root);
+        self.views.insert(view_id, new_view);
+        Ok(view_id)
+    }
+
+    fn set_view(&mut self, badge: Badge, view_id: usize) -> Result<(), Error> {
+        if !self.views.contains_key(&view_id) {
+            return Err(Error::NotFound);
+        }
+        let pid = Self::pid_from_badge(badge);
+        self.pid_view_map.insert(pid, view_id);
         Ok(())
     }
 }

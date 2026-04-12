@@ -16,6 +16,7 @@ use glenda::ipc::Badge;
 mod layout;
 mod proxy;
 mod server;
+mod view;
 pub use server::NexusManager;
 
 #[unsafe(no_mangle)]
