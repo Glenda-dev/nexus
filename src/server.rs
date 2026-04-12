@@ -181,23 +181,25 @@ impl<'a> SystemService for NexusManager<'a> {
             },
             (protocol::FS_PROTO, protocol::fs::READ_SYNC) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u_inner| {
-                    let len = u_inner.get_mr(0);
+                    let req_len = u_inner.get_mr(0);
                     let offset = u_inner.get_mr(1);
                     let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
                     let mut client = FsClient::new(target);
-                    let mut buf = alloc::vec![0u8; len];
-                    let read_len = client.read(Badge::null(), offset as usize, &mut buf)?;
-                    u_inner.write(&buf[..read_len]);
+                    let max_len = core::cmp::min(req_len, u_inner.buffer_mut().len());
+                    let read_len = {
+                        let buf = u_inner.buffer_mut();
+                        client.read(Badge::null(), offset as usize, &mut buf[..max_len])?
+                    };
+                    u_inner.set_size(read_len);
                     Ok(read_len)
                 })
             },
             (protocol::FS_PROTO, protocol::fs::WRITE_SYNC) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u_inner| {
                     let offset = u_inner.get_mr(0);
-                    let payload = alloc::vec::Vec::from(u_inner.buffer());
                     let target = *s.open_routes.get(&badge.bits()).ok_or(Error::NotFound)?;
                     let mut client = FsClient::new(target);
-                    let written = client.write(Badge::null(), offset as usize, &payload)?;
+                    let written = client.write(Badge::null(), offset as usize, u_inner.buffer())?;
                     Ok(written)
                 })
             },
