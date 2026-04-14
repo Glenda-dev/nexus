@@ -343,7 +343,7 @@ impl<'a> SystemService for NexusManager<'a> {
                     let _ = CSPACE_CAP.delete(self.ipc.reply);
                 }
                 Err(e) => {
-                    log!("Err handling FS request: {:?}", e);
+                    error!("Err handling FS request: {:?}", e);
                     utcb.set_msg_tag(MsgTag::err());
                     utcb.set_mr(0, e as usize);
                     let _ = self.reply(&mut utcb);
