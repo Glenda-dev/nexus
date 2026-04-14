@@ -184,8 +184,60 @@ impl<'a> NexusManager<'a> {
             .map(|(m_path, target, sub_path)| (String::from(m_path), target, sub_path))
     }
 
+    fn find_mount_stack_with_root(
+        &self,
+        badge: Badge,
+        path: &str,
+    ) -> Option<(String, Vec<Endpoint>, String)> {
+        let view = self.view_for_badge(badge)?;
+        view.find_mount_stack_with_root(path).map(|(m_path, stack, sub_path)| {
+            let mut layers = Vec::with_capacity(stack.len());
+            for target in stack.iter().rev() {
+                layers.push(*target);
+            }
+            (String::from(m_path), layers, sub_path)
+        })
+    }
+
     fn find_mount(&self, badge: Badge, path: &str) -> Option<(Endpoint, String)> {
-        self.find_mount_with_root(badge, path).map(|(_, target, sub_path)| (target, sub_path))
+        self.find_mount_stack_with_root(badge, path).and_then(|(_, layers, sub_path)| {
+            layers.first().copied().map(|target| (target, sub_path))
+        })
+    }
+
+    fn open_allows_layer_fallback(flags: OpenFlags) -> bool {
+        !flags.intersects(
+            OpenFlags::O_WRONLY
+                | OpenFlags::O_RDWR
+                | OpenFlags::O_CREAT
+                | OpenFlags::O_TRUNC
+                | OpenFlags::O_APPEND
+                | OpenFlags::O_EXCL,
+        )
+    }
+
+    fn call_path_layers<R, F>(&mut self, badge: Badge, path: &str, mut call: F) -> Result<R, Error>
+    where
+        F: FnMut(&mut FsClient, &str) -> Result<R, Error>,
+    {
+        let normalized = Self::normalize_absolute_path(path);
+        let (_, layers, sub_path) =
+            self.find_mount_stack_with_root(badge, &normalized).ok_or(Error::NotFound)?;
+
+        for target in layers {
+            let badged_target = self.mint_badged_endpoint(target, badge)?;
+            let mut client = FsClient::new(badged_target);
+            let ret = call(&mut client, &sub_path);
+            let _ = CSPACE_CAP.delete(badged_target.cap());
+            self.cspace.free(badged_target.cap());
+            match ret {
+                Ok(v) => return Ok(v),
+                Err(Error::NotFound) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(Error::NotFound)
     }
 
     fn mint_badged_endpoint(&mut self, target: Endpoint, badge: Badge) -> Result<Endpoint, Error> {
@@ -195,27 +247,19 @@ impl<'a> NexusManager<'a> {
     }
 
     fn lstat_global_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
-        let normalized = Self::normalize_absolute_path(path);
-        let (target, sub_path) = self.find_mount(badge, &normalized).ok_or(Error::NotFound)?;
-        let badged_target = self.mint_badged_endpoint(target, badge)?;
-        let mut client = FsClient::new(badged_target);
-        let ret = match client.lstat_path(Badge::null(), &sub_path) {
-            Ok(stat) => Ok(stat),
-            Err(Error::NotSupported) => client.stat_path(Badge::null(), &sub_path),
-            Err(e) => Err(e),
-        };
-        let _ = CSPACE_CAP.delete(badged_target.cap());
-        ret
+        self.call_path_layers(badge, path, |client, sub_path| {
+            match client.lstat_path(Badge::null(), sub_path) {
+                Ok(stat) => Ok(stat),
+                Err(Error::NotSupported) => client.stat_path(Badge::null(), sub_path),
+                Err(e) => Err(e),
+            }
+        })
     }
 
     fn readlink_global_path(&mut self, badge: Badge, path: &str) -> Result<String, Error> {
-        let normalized = Self::normalize_absolute_path(path);
-        let (target, sub_path) = self.find_mount(badge, &normalized).ok_or(Error::NotFound)?;
-        let badged_target = self.mint_badged_endpoint(target, badge)?;
-        let mut client = FsClient::new(badged_target);
-        let ret = client.readlink_path(Badge::null(), &sub_path);
-        let _ = CSPACE_CAP.delete(badged_target.cap());
-        ret
+        self.call_path_layers(badge, path, |client, sub_path| {
+            client.readlink_path(Badge::null(), sub_path)
+        })
     }
 
     fn resolve_global_path(
@@ -605,7 +649,8 @@ impl<'a> FileSystemService for NexusManager<'a> {
     ) -> Result<usize, Error> {
         log!("Open request: badge={}, path={}, flags={:?}, mode={:#o}", badge, path, flags, mode);
         let resolved = self.resolve_global_path(badge, path, true)?;
-        let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
+        let (_, layers, sub_path) =
+            self.find_mount_stack_with_root(badge, &resolved).ok_or(Error::NotFound)?;
         let (handle_id, handle_badge) = self.alloc_handle_badge(badge);
         log!(
             "Open routing: caller_badge={}, handle_id={}, handle_badge={:#x}, resolved={}, sub_path={}",
@@ -617,13 +662,29 @@ impl<'a> FileSystemService for NexusManager<'a> {
         );
 
         // 给后端文件系统一个按 handle_badge 隔离的 endpoint，随后走默认 open()。
-        let backend_handle_ep = self.mint_badged_endpoint(target, handle_badge)?;
-        let mut backend_client = FsClient::new(backend_handle_ep);
-        if let Err(e) = backend_client.open(Badge::null(), &sub_path, flags, mode, CapPtr::null()) {
-            let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
-            self.cspace.free(backend_handle_ep.cap());
-            return Err(e);
+        let allow_fallback = Self::open_allows_layer_fallback(flags);
+        let mut selected_backend: Option<Endpoint> = None;
+        for target in layers {
+            let backend_handle_ep = self.mint_badged_endpoint(target, handle_badge)?;
+            let mut backend_client = FsClient::new(backend_handle_ep);
+            match backend_client.open(Badge::null(), &sub_path, flags, mode, CapPtr::null()) {
+                Ok(_) => {
+                    selected_backend = Some(backend_handle_ep);
+                    break;
+                }
+                Err(Error::NotFound) if allow_fallback => {
+                    let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
+                    self.cspace.free(backend_handle_ep.cap());
+                }
+                Err(e) => {
+                    let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
+                    self.cspace.free(backend_handle_ep.cap());
+                    return Err(e);
+                }
+            }
         }
+
+        let backend_handle_ep = selected_backend.ok_or(Error::NotFound)?;
 
         let frontend_slot = match self.cspace.alloc(self.res_client) {
             Ok(slot) => slot,
@@ -675,6 +736,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
         let mut client = FsClient::new(badged_target);
         let ret = client.mkdir(Badge::null(), &sub_path, mode);
         let _ = CSPACE_CAP.delete(badged_target.cap());
+        self.cspace.free(badged_target.cap());
         ret
     }
 
@@ -686,6 +748,7 @@ impl<'a> FileSystemService for NexusManager<'a> {
         let mut client = FsClient::new(badged_target);
         let ret = client.unlink(Badge::null(), &sub_path);
         let _ = CSPACE_CAP.delete(badged_target.cap());
+        self.cspace.free(badged_target.cap());
         ret
     }
 
@@ -697,34 +760,25 @@ impl<'a> FileSystemService for NexusManager<'a> {
     fn stat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
         log!("Stat request: badge={}, path={}", badge, path);
         let resolved = self.resolve_global_path(badge, path, true)?;
-        let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
-        let badged_target = self.mint_badged_endpoint(target, badge)?;
-        let mut client = FsClient::new(badged_target);
-        let ret = client.stat_path(Badge::null(), &sub_path);
-        let _ = CSPACE_CAP.delete(badged_target.cap());
-        ret
+        self.call_path_layers(badge, &resolved, |client, sub_path| {
+            client.stat_path(Badge::null(), sub_path)
+        })
     }
 
     fn lstat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
         log!("Lstat request: badge={}, path={}", badge, path);
         let resolved = self.resolve_global_path(badge, path, false)?;
-        let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
-        let badged_target = self.mint_badged_endpoint(target, badge)?;
-        let mut client = FsClient::new(badged_target);
-        let ret = client.lstat_path(Badge::null(), &sub_path);
-        let _ = CSPACE_CAP.delete(badged_target.cap());
-        ret
+        self.call_path_layers(badge, &resolved, |client, sub_path| {
+            client.lstat_path(Badge::null(), sub_path)
+        })
     }
 
     fn readlink_path(&mut self, badge: Badge, path: &str) -> Result<String, Error> {
         log!("Readlink request: badge={}, path={}", badge, path);
         let resolved = self.resolve_global_path(badge, path, false)?;
-        let (target, sub_path) = self.find_mount(badge, &resolved).ok_or(Error::NotFound)?;
-        let badged_target = self.mint_badged_endpoint(target, badge)?;
-        let mut client = FsClient::new(badged_target);
-        let ret = client.readlink_path(Badge::null(), &sub_path);
-        let _ = CSPACE_CAP.delete(badged_target.cap());
-        ret
+        self.call_path_layers(badge, &resolved, |client, sub_path| {
+            client.readlink_path(Badge::null(), sub_path)
+        })
     }
 }
 
@@ -734,7 +788,10 @@ impl<'a> VirtualFileSystemService for NexusManager<'a> {
         let normalized = Self::normalize_absolute_path(path);
         let slot = self.cspace.alloc(self.res_client)?;
         CSPACE_CAP.transfer_self(target.cap(), slot)?;
-        self.view_for_badge_mut(badge)?.mounts.insert(normalized, Endpoint::from(slot));
+        let view = self.view_for_badge_mut(badge)?;
+        view.push_mount(&normalized, Endpoint::from(slot));
+        let depth = view.mounts.get(&normalized).map(|s| s.len()).unwrap_or(0);
+        log!("Mounted layer: path={}, depth={}", normalized, depth);
         Ok(())
     }
 
@@ -742,8 +799,17 @@ impl<'a> VirtualFileSystemService for NexusManager<'a> {
         log!("Unmount request: badge={}, path={}", badge, path);
         let normalized = Self::normalize_absolute_path(path);
         log!("Unmounting FS at: {}", normalized);
-        if let Some(target) = self.view_for_badge_mut(badge)?.mounts.remove(&normalized) {
+        let (popped, depth) = {
+            let view = self.view_for_badge_mut(badge)?;
+            let popped = view.pop_mount(&normalized);
+            let depth = view.mounts.get(&normalized).map(|s| s.len()).unwrap_or(0);
+            (popped, depth)
+        };
+
+        if let Some(target) = popped {
             let _ = CSPACE_CAP.delete(target.cap());
+            self.cspace.free(target.cap());
+            log!("Unmounted layer: path={}, remaining_depth={}", normalized, depth);
         }
         Ok(())
     }

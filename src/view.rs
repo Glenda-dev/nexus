@@ -6,7 +6,7 @@ use glenda::cap::Endpoint;
 #[derive(Debug, Clone)]
 pub struct View {
     pub root: String,
-    pub mounts: BTreeMap<String, Endpoint>,
+    pub mounts: BTreeMap<String, Vec<Endpoint>>,
 }
 
 impl View {
@@ -16,6 +16,20 @@ impl View {
 
     pub fn clone_with_root(&self, root: &str) -> Self {
         Self { root: Self::normalize_absolute_path(root), mounts: self.mounts.clone() }
+    }
+
+    pub fn push_mount(&mut self, path: &str, target: Endpoint) {
+        self.mounts.entry(Self::normalize_absolute_path(path)).or_default().push(target);
+    }
+
+    pub fn pop_mount(&mut self, path: &str) -> Option<Endpoint> {
+        let normalized = Self::normalize_absolute_path(path);
+        let stack = self.mounts.get_mut(&normalized)?;
+        let popped = stack.pop();
+        if stack.is_empty() {
+            self.mounts.remove(&normalized);
+        }
+        popped
     }
 
     pub fn normalize_absolute_path(path: &str) -> String {
@@ -60,23 +74,33 @@ impl View {
                 && path.as_bytes().get(parent.len()).map(|b| *b == b'/').unwrap_or(false))
     }
 
-    pub fn find_mount_with_root(&self, path: &str) -> Option<(&str, Endpoint, String)> {
-        let mut best_match: Option<(&str, Endpoint)> = None;
-        for (m_path, target) in &self.mounts {
+    pub fn find_mount_stack_with_root(&self, path: &str) -> Option<(&str, &[Endpoint], String)> {
+        let mut best_match: Option<(&str, &[Endpoint])> = None;
+        for (m_path, stack) in &self.mounts {
             if !Self::path_matches_mount(path, m_path) {
                 continue;
             }
+            let stack_slice = stack.as_slice();
+            if stack_slice.is_empty() {
+                continue;
+            }
             if best_match.is_none() || m_path.len() > best_match.unwrap().0.len() {
-                best_match = Some((m_path.as_str(), *target));
+                best_match = Some((m_path.as_str(), stack_slice));
             }
         }
 
-        best_match.map(|(m_path, target)| {
+        best_match.map(|(m_path, stack)| {
             let mut sub_path = &path[m_path.len()..];
             if sub_path.is_empty() {
                 sub_path = "/";
             }
-            (m_path, target, String::from(sub_path))
+            (m_path, stack, String::from(sub_path))
+        })
+    }
+
+    pub fn find_mount_with_root(&self, path: &str) -> Option<(&str, Endpoint, String)> {
+        self.find_mount_stack_with_root(path).and_then(|(m_path, stack, sub_path)| {
+            stack.last().copied().map(|target| (m_path, target, sub_path))
         })
     }
 
