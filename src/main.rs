@@ -8,7 +8,7 @@ extern crate alloc;
 
 use crate::layout::INIT_SLOT;
 use glenda::cap::{CapType, ENDPOINT_SLOT, Endpoint, MONITOR_CAP};
-use glenda::client::{InitClient, ResourceClient};
+use glenda::client::{AuthClient, InitClient, ResourceClient};
 use glenda::interface::ResourceService;
 use glenda::interface::system::SystemService;
 use glenda::ipc::Badge;
@@ -52,9 +52,20 @@ fn main() -> usize {
         return 1;
     }
 
-    let mut init_client = InitClient::new(Endpoint::from(INIT_SLOT));
+    if let Err(e) = res_client.get_cap(
+        Badge::null(),
+        glenda::protocol::resource::ResourceType::Endpoint,
+        glenda::protocol::resource::FACTOTUM_ENDPOINT,
+        crate::layout::AUTH_SLOT,
+    ) {
+        log!("Failed to get factotum endpoint: {:?}", e);
+        return 1;
+    }
 
-    let mut server = NexusManager::new(&mut res_client, &mut init_client);
+    let mut init_client = InitClient::new(Endpoint::from(INIT_SLOT));
+    let auth_client = AuthClient::new(Endpoint::from(crate::layout::AUTH_SLOT));
+
+    let mut server = NexusManager::new(&mut res_client, &mut init_client, &auth_client);
 
     if let Err(e) = server.init() {
         log!("Failed to init: {:?}", e);

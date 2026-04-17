@@ -3,10 +3,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply, Rights};
-use glenda::client::{FsClient, InitClient, ResourceClient};
+use glenda::client::{AuthClient, FsClient, InitClient, ResourceClient};
 use glenda::error::Error;
 use glenda::interface::CSpaceService;
 use glenda::interface::InitService;
+use glenda::interface::auth::AuthService;
 use glenda::interface::fs::{FileHandleService, FileSystemService, VirtualFileSystemService};
 use glenda::interface::system::SystemService;
 use glenda::ipc::server::handle_call;
@@ -24,6 +25,7 @@ pub struct NexusIpc {
 pub struct NexusManager<'a> {
     res_client: &'a mut ResourceClient,
     init_client: &'a mut InitClient,
+    auth_client: &'a AuthClient,
 
     // CSpace Management
     cspace: CSpaceManager,
@@ -40,6 +42,8 @@ pub struct NexusManager<'a> {
 
     // Lifecycle
     ipc: NexusIpc,
+    auth_cache: BTreeMap<(usize, String, String), (bool, u64)>,
+    auth_tick: u64,
 }
 
 impl<'a> NexusManager<'a> {
@@ -48,13 +52,18 @@ impl<'a> NexusManager<'a> {
     const S_IFLNK: u32 = 0o120000;
     const MAX_SYMLINK_DEPTH: usize = 40;
 
-    pub fn new(res_client: &'a mut ResourceClient, init_client: &'a mut InitClient) -> Self {
+    pub fn new(
+        res_client: &'a mut ResourceClient,
+        init_client: &'a mut InitClient,
+        auth_client: &'a AuthClient,
+    ) -> Self {
         let mut views = BTreeMap::new();
         views.insert(Self::DEFAULT_VIEW_ID, View::new("/"));
 
         Self {
             res_client,
             init_client,
+            auth_client,
             cspace: CSpaceManager::new(CSPACE_CAP, 16),
             views,
             pid_view_map: BTreeMap::new(),
@@ -67,7 +76,49 @@ impl<'a> NexusManager<'a> {
                 reply: glenda::cap::REPLY_SLOT,
                 recv: glenda::cap::RECV_SLOT,
             },
+            auth_cache: BTreeMap::new(),
+            auth_tick: 0,
         }
+    }
+
+    fn next_auth_tick(&mut self) -> u64 {
+        self.auth_tick = self.auth_tick.wrapping_add(1);
+        self.auth_tick
+    }
+
+    fn authorize_path_op(
+        &mut self,
+        badge: Badge,
+        path: &str,
+        operation: &str,
+    ) -> Result<(), Error> {
+        let pid = Self::pid_from_badge(badge);
+        let normalized = Self::normalize_absolute_path(path);
+        let now = self.next_auth_tick();
+        let key = (pid, String::from(operation), normalized.clone());
+
+        if let Some((allowed, expire_tick)) = self.auth_cache.get(&key)
+            && *expire_tick >= now
+        {
+            return if *allowed { Ok(()) } else { Err(Error::PermissionDenied) };
+        }
+
+        let decision = match self.auth_client.check_permission(pid, &normalized, operation) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    "auth check failed: pid={}, op={}, path={}, err={:?}",
+                    pid, operation, normalized, e
+                );
+                return Err(Error::PermissionDenied);
+            }
+        };
+
+        let allowed = decision.allowed != 0;
+        let ttl = core::cmp::max(decision.ttl_ms as u64, 1);
+        self.auth_cache.insert(key, (allowed, now.saturating_add(ttl)));
+
+        if allowed { Ok(()) } else { Err(Error::PermissionDenied) }
     }
 
     fn handle_key_from_badge(badge: Badge) -> usize {
@@ -404,6 +455,7 @@ impl<'a> SystemService for NexusManager<'a> {
                 let path = unsafe { u.read_str()? };
                 let flags = OpenFlags::from_bits_truncate(u.get_mr(0));
                 let mode = u.get_mr(1) as u32;
+                s.authorize_path_op(badge, &path, "open")?;
                 let fd = s.open(badge, &path, flags, mode, u.get_recv_window())?;
                 let route_slot = *s.open_route_caps.get(&fd).ok_or(Error::NotFound)?;
 
@@ -420,6 +472,7 @@ impl<'a> SystemService for NexusManager<'a> {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
                     let mode = u.get_mr(0) as u32;
+                    s.authorize_path_op(badge, &path, "mkdir")?;
                     s.mkdir(badge, &path, mode)?;
                     Ok(())
                 })
@@ -427,6 +480,7 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::UNLINK) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
+                    s.authorize_path_op(badge, &path, "unlink")?;
                     s.unlink(badge, &path)?;
                     Ok(())
                 })
@@ -434,6 +488,7 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::STAT_PATH) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
+                    s.authorize_path_op(badge, &path, "stat_path")?;
                     let stat = s.stat_path(badge, &path)?;
                     unsafe { u.write_obj(&stat)? };
                     Ok(())
@@ -443,6 +498,7 @@ impl<'a> SystemService for NexusManager<'a> {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
                     let target_ep_cap = s.ipc.recv;
+                    s.authorize_path_op(badge, &path, "mount")?;
                     s.mount(badge, &path, Endpoint::from(target_ep_cap))?;
                     Ok(())
                 })
@@ -450,6 +506,7 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::UNMOUNT) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
+                    s.authorize_path_op(badge, &path, "unmount")?;
                     s.unmount(badge, &path)?;
                     Ok(())
                 })
@@ -563,6 +620,7 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::LSTAT_PATH) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
+                    s.authorize_path_op(badge, &path, "lstat_path")?;
                     let stat = s.lstat_path(badge, &path)?;
                     unsafe { u.write_obj(&stat)? };
                     Ok(0usize)
@@ -571,6 +629,7 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::READLINK_PATH) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
+                    s.authorize_path_op(badge, &path, "readlink_path")?;
                     let target = s.readlink_path(badge, &path)?;
                     unsafe { u.write_str(&target)? };
                     Ok(0usize)
