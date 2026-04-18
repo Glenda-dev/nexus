@@ -297,6 +297,38 @@ impl<'a> NexusManager<'a> {
         Ok(Endpoint::from(slot))
     }
 
+    fn proxy_open_route(&mut self, badge: Badge, utcb: &mut UTCB) -> Result<(), Error> {
+        let handle_key = Self::handle_key_from_badge(badge);
+        let target = *self.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
+
+        // 对于经由 recv_window 收到的能力，需要在 proxy 前将 cap_transfer
+        // 显式指向本进程可见槽位，否则内核 transfer_cap 无法解析源能力。
+        if utcb.get_msg_tag().flags().contains(MsgFlags::HAS_CAP) {
+            utcb.set_cap_transfer(self.ipc.recv);
+        }
+
+        target.proxy(utcb)?;
+        Err(Error::Success)
+    }
+
+    fn close_open_route(&mut self, badge: Badge) -> Result<(), Error> {
+        let handle_key = Self::handle_key_from_badge(badge);
+        let target = self.open_routes.remove(&handle_key).ok_or(Error::NotFound)?;
+
+        if let Some(route_slot) = self.open_route_caps.remove(&handle_key) {
+            let _ = CSPACE_CAP.delete(route_slot);
+            self.cspace.free(route_slot);
+        }
+
+        let mut client = FsClient::new(target);
+        let close_res = client.close(Badge::null());
+
+        let _ = CSPACE_CAP.delete(target.cap());
+        self.cspace.free(target.cap());
+
+        close_res
+    }
+
     fn lstat_global_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
         self.call_path_layers(badge, path, |client, sub_path| {
             match client.lstat_path(Badge::null(), sub_path) {
@@ -526,96 +558,25 @@ impl<'a> SystemService for NexusManager<'a> {
                 })
             },
             (protocol::FS_PROTO, protocol::fs::READ_SYNC) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |u_inner| {
-                    let req_len = u_inner.get_mr(0);
-                    let offset = u_inner.get_mr(1);
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
-                    let mut client = FsClient::new(target);
-                    let max_len = core::cmp::min(req_len, u_inner.buffer_mut().len());
-                    let read_len = {
-                        let buf = u_inner.buffer_mut();
-                        client.read(Badge::null(), offset as usize, &mut buf[..max_len])?
-                    };
-                    u_inner.set_size(read_len);
-                    Ok(read_len)
-                })
+                s.proxy_open_route(badge, u)
             },
             (protocol::FS_PROTO, protocol::fs::WRITE_SYNC) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |u_inner| {
-                    let offset = u_inner.get_mr(0);
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
-                    let mut client = FsClient::new(target);
-                    let written = client.write(Badge::null(), offset as usize, u_inner.buffer())?;
-                    Ok(written)
-                })
+                s.proxy_open_route(badge, u)
             },
             (protocol::FS_PROTO, protocol::fs::SETUP_IOURING) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |u_inner| {
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
-                    log!(
-                        "Setup iouring forward: badge={:#x}, handle_key={}, size={}, client_vaddr={:#x}, has_cap={}",
-                        badge.bits(),
-                        handle_key,
-                        u_inner.get_mr(0),
-                        u_inner.get_mr(1),
-                        u_inner.get_msg_tag().flags().contains(MsgFlags::HAS_CAP)
-                    );
-                    let mut fwd = unsafe { UTCB::new() };
-                    fwd.clear();
-
-                    let mut flags = MsgFlags::NONE;
-                    if u_inner.get_msg_tag().flags().contains(MsgFlags::HAS_CAP) {
-                        flags |= MsgFlags::HAS_CAP;
-                        fwd.set_cap_transfer(s.ipc.recv);
-                    }
-
-                    fwd.set_mr(0, u_inner.get_mr(0));
-                    fwd.set_mr(1, u_inner.get_mr(1));
-                    fwd.set_mr(2, u_inner.get_mr(2));
-                    fwd.set_msg_tag(MsgTag::new(protocol::FS_PROTO, protocol::fs::SETUP_IOURING, flags));
-                    target.call(&mut fwd)?;
-                    log!("Setup iouring forward done: badge={:#x}, handle_key={}", badge.bits(), handle_key);
-                    Ok(0usize)
-                })
+                s.proxy_open_route(badge, u)
             },
             (protocol::FS_PROTO, protocol::fs::PROCESS_IOURING) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |_u_inner| {
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
-                    let mut fwd = unsafe { UTCB::new() };
-                    fwd.clear();
-                    fwd.set_msg_tag(MsgTag::new(protocol::FS_PROTO, protocol::fs::PROCESS_IOURING, MsgFlags::NONE));
-                    target.call(&mut fwd)?;
-                    Ok(0usize)
-                })
+                s.proxy_open_route(badge, u)
             },
             (protocol::FS_PROTO, protocol::fs::CLOSE) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |_u_inner| {
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = s.open_routes.remove(&handle_key).ok_or(Error::NotFound)?;
-                    let mut client = FsClient::new(target);
-                    client.close(Badge::null())?;
-                    let _ = CSPACE_CAP.delete(target.cap());
-                    s.cspace.free(target.cap());
-                    if let Some(route_slot) = s.open_route_caps.remove(&handle_key) {
-                        let _ = CSPACE_CAP.delete(route_slot);
-                        s.cspace.free(route_slot);
-                    }
+                handle_call(u, |_u| {
+                    s.close_open_route(badge)?;
                     Ok(0usize)
                 })
             },
             (protocol::FS_PROTO, protocol::fs::STAT) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |u_inner| {
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
-                    let client = FsClient::new(target);
-                    let stat = client.stat(Badge::null())?;
-                    unsafe { u_inner.write_obj(&stat)? };
-                    Ok(0usize)
-                })
+                s.proxy_open_route(badge, u)
             },
             (protocol::FS_PROTO, protocol::fs::LSTAT_PATH) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
@@ -636,45 +597,16 @@ impl<'a> SystemService for NexusManager<'a> {
                 })
             },
             (protocol::FS_PROTO, protocol::fs::GETDENTS) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |u_inner| {
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
-                    let count = u_inner.get_mr(0);
-                    let mut client = FsClient::new(target);
-                    let entries = client.getdents(Badge::null(), count)?;
-                    unsafe { u_inner.write_vec(&entries)?; }
-                    Ok(0usize)
-                })
+                s.proxy_open_route(badge, u)
             },
             (protocol::FS_PROTO, protocol::fs::SEEK) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |u_inner| {
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
-                    let offset = u_inner.get_mr(0) as i64;
-                    let whence = u_inner.get_mr(1);
-                    let mut client = FsClient::new(target);
-                    let new_off = client.seek(Badge::null(), offset, whence)?;
-                    Ok(new_off)
-                })
+                s.proxy_open_route(badge, u)
             },
             (protocol::FS_PROTO, protocol::fs::SYNC) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |_u_inner| {
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
-                    let mut client = FsClient::new(target);
-                    client.sync(Badge::null())?;
-                    Ok(0usize)
-                })
+                s.proxy_open_route(badge, u)
             },
             (protocol::FS_PROTO, protocol::fs::TRUNCATE) => |s: &mut Self, u: &mut UTCB| {
-                handle_call(u, |u_inner| {
-                    let handle_key = Self::handle_key_from_badge(badge);
-                    let target = *s.open_routes.get(&handle_key).ok_or(Error::NotFound)?;
-                    let size = u_inner.get_mr(0);
-                    let mut client = FsClient::new(target);
-                    client.truncate(Badge::null(), size)?;
-                    Ok(0usize)
-                })
+                s.proxy_open_route(badge, u)
             },
             (_, _) => |_, u: &mut UTCB| {
                 error!(
