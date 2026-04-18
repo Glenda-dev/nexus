@@ -461,6 +461,8 @@ impl<'a> SystemService for NexusManager<'a> {
                 continue;
             }
 
+            let incoming_has_cap = utcb.get_msg_tag().flags().contains(MsgFlags::HAS_CAP);
+
             match self.dispatch(&mut utcb) {
                 Ok(()) => {
                     let _ = self.reply(&mut utcb);
@@ -476,6 +478,10 @@ impl<'a> SystemService for NexusManager<'a> {
                     let _ = self.reply(&mut utcb);
                 }
             }
+
+            if incoming_has_cap {
+                let _ = CSPACE_CAP.delete(self.ipc.recv);
+            }
         }
     }
 
@@ -490,9 +496,12 @@ impl<'a> SystemService for NexusManager<'a> {
                 s.authorize_path_op(badge, &path, "open")?;
                 let fd = s.open(badge, &path, flags, mode, u.get_recv_window())?;
                 let route_slot = *s.open_route_caps.get(&fd).ok_or(Error::NotFound)?;
+                let transfer_slot = s.ipc.recv;
+                let _ = CSPACE_CAP.delete(transfer_slot);
+                CSPACE_CAP.copy_self(route_slot, transfer_slot, Rights::ALL)?;
 
                 u.set_mr(0, fd);
-                u.set_cap_transfer(route_slot);
+                u.set_cap_transfer(transfer_slot);
                 u.set_msg_tag(MsgTag::new(
                     protocol::GENERIC_PROTO,
                     protocol::generic::REPLY,
