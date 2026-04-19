@@ -578,6 +578,12 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::PROCESS_IOURING) => |s: &mut Self, u: &mut UTCB| {
                 s.proxy_open_route(badge, u)
             },
+            (protocol::FS_PROTO, protocol::fs::MAP_PAGE) => |s: &mut Self, u: &mut UTCB| {
+                s.proxy_open_route(badge, u)
+            },
+            (protocol::FS_PROTO, protocol::fs::UNMAP_PAGE) => |s: &mut Self, u: &mut UTCB| {
+                s.proxy_open_route(badge, u)
+            },
             (protocol::FS_PROTO, protocol::fs::CLOSE) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |_u| {
                     s.close_open_route(badge)?;
