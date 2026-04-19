@@ -89,6 +89,26 @@ impl FileSystemService for FileSystemProxy {
         Err(Error::Success)
     }
 
+    fn link(&mut self, badge: Badge, old_path: &str, new_path: &str) -> Result<(), Error> {
+        log!(
+            "link forward: badge={}, old_path={}, new_path={}",
+            badge.bits(),
+            old_path,
+            new_path
+        );
+        let utcb = unsafe { UTCB::new() };
+        utcb.clear();
+        utcb.set_badge(badge);
+        unsafe { utcb.write_postcard(&(old_path, new_path))? };
+        utcb.set_msg_tag(MsgTag::new(
+            protocol::FS_PROTO,
+            protocol::fs::LINK,
+            MsgFlags::HAS_BUFFER,
+        ));
+        self.0.proxy(utcb)?;
+        Err(Error::Success)
+    }
+
     fn stat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
         log!("stat forward: badge={}, path={}", badge.bits(), path);
         let utcb = unsafe { UTCB::new() };

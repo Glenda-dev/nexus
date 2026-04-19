@@ -526,6 +526,15 @@ impl<'a> SystemService for NexusManager<'a> {
                     Ok(())
                 })
             },
+            (protocol::FS_PROTO, protocol::fs::LINK) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u| {
+                    let (old_path, new_path): (String, String) = unsafe { u.read_postcard()? };
+                    s.authorize_path_op(badge, &old_path, "link")?;
+                    s.authorize_path_op(badge, &new_path, "link")?;
+                    s.link(badge, &old_path, &new_path)?;
+                    Ok(0usize)
+                })
+            },
             (protocol::FS_PROTO, protocol::fs::STAT_PATH) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
@@ -761,6 +770,33 @@ impl<'a> FileSystemService for NexusManager<'a> {
     fn rename(&mut self, _badge: Badge, _old_path: &str, _new_path: &str) -> Result<(), Error> {
         log!("Rename request: badge={}, old_path={}, new_path={}", _badge, _old_path, _new_path);
         Err(Error::NotSupported)
+    }
+
+    fn link(&mut self, badge: Badge, old_path: &str, new_path: &str) -> Result<(), Error> {
+        log!("Link request: badge={}, old_path={}, new_path={}", badge, old_path, new_path);
+        let resolved_old = self.resolve_global_path(badge, old_path, false)?;
+        let normalized_new = Self::normalize_absolute_path(new_path);
+        let (new_parent, new_name) = Self::split_parent_name(&normalized_new)?;
+        let resolved_new_parent = self.resolve_global_path(badge, &new_parent, true)?;
+        let resolved_new = Self::join_paths(&resolved_new_parent, &new_name);
+
+        let (old_target, old_sub_path) =
+            self.find_mount(badge, &resolved_old).ok_or(Error::NotFound)?;
+        let (new_target, new_sub_path) =
+            self.find_mount(badge, &resolved_new).ok_or(Error::NotFound)?;
+
+        if old_target.cap() != new_target.cap() {
+            // TODO: return a dedicated cross-device error (EXDEV mapping) once the shared
+            // error model exposes one; currently we report NotSupported for cross-mount links.
+            return Err(Error::NotSupported);
+        }
+
+        let badged_target = self.mint_badged_endpoint(old_target, badge)?;
+        let mut client = FsClient::new(badged_target);
+        let ret = client.link(Badge::null(), &old_sub_path, &new_sub_path);
+        let _ = CSPACE_CAP.delete(badged_target.cap());
+        self.cspace.free(badged_target.cap());
+        ret
     }
 
     fn stat_path(&mut self, badge: Badge, path: &str) -> Result<Stat, Error> {
