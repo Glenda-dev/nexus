@@ -376,6 +376,16 @@ impl<'a> NexusManager<'a> {
                     continue;
                 }
 
+                let on_mount_root = self
+                    .find_mount_with_root(badge, &prefix)
+                    .map(|(mount_path, _, _)| mount_path == prefix)
+                    .unwrap_or(false);
+                if on_mount_root {
+                    // Mount root behaves as an opaque traversal point in namespace resolution.
+                    // Skip symlink probing here and continue resolving deeper components.
+                    continue;
+                }
+
                 let st = self.lstat_global_path(badge, &prefix)?;
                 if !Self::is_symlink_mode(st.mode) {
                     continue;
@@ -632,6 +642,12 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::TRUNCATE) => |s: &mut Self, u: &mut UTCB| {
                 s.proxy_open_route(badge, u)
             },
+            (protocol::FS_PROTO, protocol::fs::IOCTL) => |s: &mut Self, u: &mut UTCB| {
+                s.proxy_open_route(badge, u)
+            },
+            (protocol::FS_PROTO, protocol::fs::IOCTL_EX) => |s: &mut Self, u: &mut UTCB| {
+                s.proxy_open_route(badge, u)
+            },
             (_, _) => |_, u: &mut UTCB| {
                 error!(
                     "Unknown request: badge={}, proto={:#x}, label={:#x}",
@@ -663,7 +679,19 @@ impl<'a> FileSystemService for NexusManager<'a> {
         _recv_slot: CapPtr,
     ) -> Result<usize, Error> {
         log!("Open request: badge={}, path={}, flags={:?}, mode={:#o}", badge, path, flags, mode);
-        let resolved = self.resolve_global_path(badge, path, true)?;
+        let resolved = match self.resolve_global_path(badge, path, true) {
+            Ok(path) => path,
+            Err(Error::NotFound) if flags.contains(OpenFlags::O_CREAT) => {
+                let normalized = Self::normalize_absolute_path(path);
+                let (parent, name) = Self::split_parent_name(&normalized)?;
+                let resolved_parent = self.resolve_global_path(badge, &parent, true)?;
+                Self::join_paths(&resolved_parent, &name)
+            }
+            Err(Error::NotSupported | Error::InvalidType | Error::Unknown) => {
+                self.resolve_global_path(badge, path, false)?
+            }
+            Err(e) => return Err(e),
+        };
         let (_, layers, sub_path) =
             self.find_mount_stack_with_root(badge, &resolved).ok_or(Error::NotFound)?;
         let (handle_id, handle_badge) = self.alloc_handle_badge(badge);
@@ -680,18 +708,31 @@ impl<'a> FileSystemService for NexusManager<'a> {
         let allow_fallback = Self::open_allows_layer_fallback(flags);
         let mut selected_backend: Option<Endpoint> = None;
         for target in layers {
+            log!(
+                "Open try: handle_id={}, target_ep={:?}, sub_path={}, fallback={}",
+                handle_id, target, sub_path, allow_fallback
+            );
             let backend_handle_ep = self.mint_badged_endpoint(target, handle_badge)?;
             let mut backend_client = FsClient::new(backend_handle_ep);
             match backend_client.open(Badge::null(), &sub_path, flags, mode, CapPtr::null()) {
                 Ok(_) => {
                     selected_backend = Some(backend_handle_ep);
+                    log!("Open selected: handle_id={}, backend_ep={:?}", handle_id, backend_handle_ep);
                     break;
                 }
                 Err(Error::NotFound) if allow_fallback => {
+                    log!(
+                        "Open fallback: handle_id={}, backend_ep={:?}, reason=NotFound",
+                        handle_id, backend_handle_ep
+                    );
                     let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
                     self.cspace.free(backend_handle_ep.cap());
                 }
                 Err(e) => {
+                    log!(
+                        "Open failed: handle_id={}, backend_ep={:?}, err={:?}",
+                        handle_id, backend_handle_ep, e
+                    );
                     let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
                     self.cspace.free(backend_handle_ep.cap());
                     return Err(e);
