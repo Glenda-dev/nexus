@@ -612,6 +612,9 @@ impl<'a> SystemService for NexusManager<'a> {
             (protocol::FS_PROTO, protocol::fs::STAT) => |s: &mut Self, u: &mut UTCB| {
                 s.proxy_open_route(badge, u)
             },
+            (protocol::FS_PROTO, protocol::fs::POLL) => |s: &mut Self, u: &mut UTCB| {
+                s.proxy_open_route(badge, u)
+            },
             (protocol::FS_PROTO, protocol::fs::LSTAT_PATH) => |s: &mut Self, u: &mut UTCB| {
                 handle_call(u, |u| {
                     let path = unsafe { u.read_str()? };
@@ -710,20 +713,28 @@ impl<'a> FileSystemService for NexusManager<'a> {
         for target in layers {
             log!(
                 "Open try: handle_id={}, target_ep={:?}, sub_path={}, fallback={}",
-                handle_id, target, sub_path, allow_fallback
+                handle_id,
+                target,
+                sub_path,
+                allow_fallback
             );
             let backend_handle_ep = self.mint_badged_endpoint(target, handle_badge)?;
             let mut backend_client = FsClient::new(backend_handle_ep);
             match backend_client.open(Badge::null(), &sub_path, flags, mode, CapPtr::null()) {
                 Ok(_) => {
                     selected_backend = Some(backend_handle_ep);
-                    log!("Open selected: handle_id={}, backend_ep={:?}", handle_id, backend_handle_ep);
+                    log!(
+                        "Open selected: handle_id={}, backend_ep={:?}",
+                        handle_id,
+                        backend_handle_ep
+                    );
                     break;
                 }
                 Err(Error::NotFound) if allow_fallback => {
                     log!(
                         "Open fallback: handle_id={}, backend_ep={:?}, reason=NotFound",
-                        handle_id, backend_handle_ep
+                        handle_id,
+                        backend_handle_ep
                     );
                     let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
                     self.cspace.free(backend_handle_ep.cap());
@@ -731,7 +742,9 @@ impl<'a> FileSystemService for NexusManager<'a> {
                 Err(e) => {
                     log!(
                         "Open failed: handle_id={}, backend_ep={:?}, err={:?}",
-                        handle_id, backend_handle_ep, e
+                        handle_id,
+                        backend_handle_ep,
+                        e
                     );
                     let _ = CSPACE_CAP.delete(backend_handle_ep.cap());
                     self.cspace.free(backend_handle_ep.cap());
